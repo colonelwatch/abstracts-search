@@ -1,0 +1,3 @@
+[submodule "abstracts-embeddings"]
+	path = abstracts-embeddings
+	url = git@hf.co:datasets/colonelwatch/abstracts-embeddings.git
