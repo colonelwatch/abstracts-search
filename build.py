@@ -199,7 +199,7 @@ if __name__ == '__main__':
     print('Merging partial works idxs lists...')
     idxs_chunks_paths = [f'partial_works/idxs_{i}.txt' for i in range(len(works_urls))]
     with open('abstracts-embeddings/idxs.txt', 'w') as f:
-        for i, idxs_chunk_path in enumerate(idxs_chunks_paths):
+        for i, idxs_chunk_path in tqdm.tqdm(enumerate(idxs_chunks_paths), desc='idxs_chunks'):
             with open(idxs_chunk_path) as g:
                 idxs_chunk = g.read()
             f.write(idxs_chunk)
@@ -219,7 +219,7 @@ if __name__ == '__main__':
     embeddings = np.memmap('abstracts-embeddings/embeddings.memmap', dtype=np.float16, mode='w+', shape=(n_rows, D))
     
     rows_ptr = 0
-    for embeddings_chunk_path in embeddings_chunks_paths: # yes, this is the iterating over the same list twice
+    for embeddings_chunk_path in tqdm.tqdm(embeddings_chunks_paths, desc='embeddings_chunks'):
         embeddings_chunk = np.load(embeddings_chunk_path)
         embeddings[rows_ptr:rows_ptr+len(embeddings_chunk)] = embeddings_chunk
         rows_ptr += len(embeddings_chunk)

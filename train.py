@@ -6,6 +6,7 @@
 import os
 import numpy as np
 import torch
+from tqdm import trange
 from tqdm.contrib.concurrent import thread_map
 import faiss
 import gc
@@ -59,7 +60,7 @@ else:
     np.save(idxs_train_path, idxs_train)
 
     embeddings_train = np.memmap(works_train_path, dtype=np.float32, mode='w+', shape=(TRAIN_SIZE, D))
-    for i in range(TRAIN_SIZE//CHUNK_SIZE+1):
+    for i in trange(TRAIN_SIZE//CHUNK_SIZE+1):
         idxs_train_chunk = idxs_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE]
         embeddings_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE] = embeddings[idxs_train_chunk]
         embeddings_train.flush()
@@ -157,7 +158,7 @@ n_embeddings = len(embeddings)
 purge_from_memory(embeddings)
 
 index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
-for i in range(len(embeddings)//CHUNK_SIZE+1):
+for i in trange(len(embeddings)//CHUNK_SIZE+1):
     offset = i*CHUNK_SIZE
     shape = (min(CHUNK_SIZE, n_embeddings-offset), D)
     n_bytes_per_elem = np.dtype(np.float16).itemsize
