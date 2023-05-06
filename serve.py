@@ -90,13 +90,61 @@ def search(query, api_key):
         openalex_id = lookup_openalex_id(faiss_id)
 
         response = requests.get(f'https://api.openalex.org/works/{openalex_id}').json()
+
+        # collect attributes from openalex response for the given openalex_id
         title = response['title']
-        inverted_index = response['abstract_inverted_index']
-        abstract = recover_abstract(inverted_index)
+        abstract = recover_abstract(response['abstract_inverted_index'])
+        author_names = [authorship['author']['display_name'] for authorship in response['authorships']]
+        # journal_name = response['primary_location']['source']['display_name']
+        publication_year = response['publication_year']
+        citation_count = response['cited_by_count']
+        doi = response['doi']
 
+        # try to get journal name or else set it to None
+        try:
+            journal_name = response['primary_location']['source']['display_name']
+        except (TypeError, KeyError):
+            journal_name = None
+
+        # abstract: knock out escape sequences, then truncate to 1500 characters if necessary
         abstract = abstract.replace('\n', '\\n').replace('\r', '\\r')
+        if len(abstract) > 2000:
+            abstract = abstract[:2000] + '...'
+        
+        # authors: truncate to 3 authors if necessary
+        if len(author_names) >= 3:
+            authors_str = ', '.join(author_names[:3]) + ', ...'
+        else:
+            authors_str = ', '.join(author_names)
 
-        result_string += f'[{distance:.2f}] "{title}": {abstract}\n\n'
+        
+        entry_string = ''
+
+        if doi: # edge case: for now, no doi -> no link
+            entry_string += f'## [{title}]({doi})\n'
+        else:
+            entry_string += f'## {title}\n'
+        
+        if journal_name:
+            entry_string += f'**{authors_str} - {journal_name}, {publication_year}**\n'
+        else:
+            entry_string += f'**{authors_str}, {publication_year}**\n'
+        
+        entry_string += f'{abstract}\n'
+        
+        if citation_count: # edge case: we shouldn't tack "Cited-by count: 0" onto someone's paper
+            entry_string += f'*Cited-by count: {citation_count}*'
+            entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;'
+        
+        if doi: # list the doi if it exists
+            entry_string += f'*DOI: {doi.replace("https://doi.org/", "")}*'
+            entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;'
+        
+        entry_string += f'*Pseudodocument similarity: {distance:.2f}*'
+        entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;\n'
+
+        result_string += entry_string
+
         yield pseudodocument_string, result_string
 
 with gr.Blocks() as demo:
@@ -116,22 +164,20 @@ with gr.Blocks() as demo:
                 label='OpenAI API Key'
             )
             query = gr.Textbox(
-                lines=3, 
+                lines=2, 
                 placeholder='Enter your query here', 
                 label='Query'
             )
-            btn = gr.Button('Search')
+        with gr.Column():
             pseudodocument = gr.Textbox(
-                max_lines=10, 
+                lines=7, 
+                max_lines=7,
                 placeholder='Awaiting query...', 
                 label='Pseudodocument'
             )
-        with gr.Column():
-            results = gr.Textbox(
-                max_lines=24, 
-                placeholder='Awaiting query...', 
-                label='Results'
-            )
+    btn = gr.Button('Search')
+    with gr.Box():
+        results = gr.Markdown()
     
     btn.click(search, inputs=[query, api_key], outputs=[pseudodocument, results])
 
