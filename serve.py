@@ -17,7 +17,7 @@ index = faiss.read_index('abstracts-embeddings/index.faiss')
 
 ps = faiss.ParameterSpace()
 ps.initialize(index)
-ps.set_index_parameters(index, 'nprobe=2048')
+ps.set_index_parameters(index, 'nprobe=16,ht=256')
 
 
 def generate_pseudodocument(query, api_key):

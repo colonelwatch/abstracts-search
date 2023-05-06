@@ -14,11 +14,16 @@ TRAIN_SIZE = 4194304
 TEST_SIZE = 131072 # the size of the test set that will be held out until after the index is evaluated
 CHUNK_SIZE = 1048576 # keep at a small number to avoid running out of memory
 D = 384 # dimension of the embeddings
-FACTORY_STRING = 'OPQ64_128,IVF65536,PQ64'
+FACTORY_STRING = 'OPQ32_128,IVF65536,PQ32'
 
 def purge_from_memory(obj):
     del obj
     gc.collect()
+
+
+# As long as sampling of the embeddings set is still used, a fixed seed is necessary to keep the samplings reproducible
+# TODO: check if random sampling is even necessary
+np.random.seed(42)
 
 
 works_path = 'abstracts-embeddings/embeddings.memmap'
@@ -48,20 +53,20 @@ else:
 
     print('Generating train set...')
     idxs_train = np.random.choice(len(embeddings), size=TRAIN_SIZE, replace=False)
+    idxs_train = np.sort(idxs_train)
     np.save(idxs_train_path, idxs_train)
 
     embeddings_train = np.memmap(works_train_path, dtype=np.float32, mode='w+', shape=(TRAIN_SIZE, D))
     for i in range(TRAIN_SIZE//CHUNK_SIZE+1):
         idxs_train_chunk = idxs_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE]
-        embeddings_train_chunk = embeddings[idxs_train_chunk]
-        embeddings_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE] = embeddings_train_chunk
-    embeddings_train.flush()
+        embeddings_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE] = embeddings[idxs_train_chunk]
+        embeddings_train.flush()
 
     purge_from_memory(embeddings_train)
     purge_from_memory(embeddings)
 
 
-BATCH_SIZE = 8192
+BATCH_SIZE = 4096
 N_VECTORS_COMPARED = 65536
 def search_routine(idxs_queries_batch):
     embeddings_test_batch = embeddings[idxs_queries_batch]
@@ -101,12 +106,11 @@ if os.path.exists(idxs_queries_path):
 
 if queries_set_found:
     print('Queries test set found, skipping queries and ground truth sets generation...')
-
-    idxs_queries = np.load(idxs_queries_path)
-    idxs_gt = np.load(idxs_gt_path)
 else:
     print('Queries test set not found or invalid, generating queries and ground truth sets...')
 
+    # TODO: right now, search_routine counts in this reference existing, but this reference actually shows up in the 
+    #  code AFTER search_routine is defined. This is a confusing design.
     embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
     n_embeddings = len(embeddings)
 
@@ -114,10 +118,10 @@ else:
     idxs_train = np.load(idxs_train_path)
     is_in_train = np.isin(idxs, idxs_train)
     idxs_queries = np.random.choice(idxs[~is_in_train], size=TEST_SIZE, replace=False)
-    embeddings_test = embeddings[idxs_queries]
+    idxs_queries = np.sort(idxs_queries)
 
     idxs_queries_batches = np.array_split(idxs_queries, TEST_SIZE//BATCH_SIZE)
-    idxs_gt_batches = thread_map(search_routine, idxs_queries_batches, max_workers=2, desc='query batches')
+    idxs_gt_batches = thread_map(search_routine, idxs_queries_batches, max_workers=3, desc='query batches')
     idxs_gt = np.vstack(idxs_gt_batches)
 
     np.save(idxs_queries_path, idxs_queries)
@@ -143,11 +147,15 @@ purge_from_memory(embeddings_train)
 
 
 print('Adding embeddings (except the test set) to trained index...')
+
 embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
+n_embeddings = len(embeddings)
+purge_from_memory(embeddings)
+
 index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
 for i in range(len(embeddings)//CHUNK_SIZE+1):
     offset = i*CHUNK_SIZE
-    shape = (min(CHUNK_SIZE, len(embeddings)-offset), D)
+    shape = (min(CHUNK_SIZE, n_embeddings-offset), D)
     n_bytes_per_elem = np.dtype(np.float16).itemsize
     shard = np.memmap(works_path, dtype=np.float16, mode='r', offset=offset*D*n_bytes_per_elem, shape=shape)
     shard = shard.astype(np.float32, copy=True)
@@ -161,25 +169,26 @@ for i in range(len(embeddings)//CHUNK_SIZE+1):
     purge_from_memory(shard)
 index = faiss.index_gpu_to_cpu(index)
 faiss.write_index(index, index_path)
-purge_from_memory(embeddings)
 
 
 print('Evaluating index...')
 
+idxs_queries = np.load(idxs_queries_path)
+idxs_gt = np.load(idxs_gt_path)
+
 embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
-embeddings_test = embeddings[idxs_queries]
+embeddings_test = embeddings[idxs_queries].astype(np.float32, copy=True)
+purge_from_memory(embeddings) # after getting the test set, we don't need the whole embeddings array anymore
 
 tuning_criterion = faiss.IntersectionCriterion(TEST_SIZE, 10)
 tuning_criterion.set_groundtruth(None, idxs_gt)
 
 index = faiss.read_index(index_path)
-index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
-param_space = faiss.GpuParameterSpace()
+param_space = faiss.ParameterSpace()
 param_space.initialize(index)
 param_values = param_space.explore(index, embeddings_test, tuning_criterion)
 
 param_values.display()
-purge_from_memory(embeddings)
 
 
 print('Adding test set to index...')
