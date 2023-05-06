@@ -22,11 +22,6 @@ def purge_from_memory(obj):
     gc.collect()
 
 
-# As long as sampling of the embeddings set is still used, a fixed seed is necessary to keep the samplings reproducible
-# TODO: check if random sampling is even necessary
-np.random.seed(42)
-
-
 works_path = 'abstracts-embeddings/embeddings.memmap'
 works_train_path = 'abstracts-embeddings/train/train.memmap'
 idxs_train_path = 'abstracts-embeddings/train/idxs_train.npy'
@@ -37,10 +32,19 @@ index_path = 'abstracts-embeddings/index.faiss'
 os.makedirs('abstracts-embeddings/train', exist_ok=True)
 
 
+# The sampling should be random, so we'll use a reproducible shuffle to do it
+embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
+n_embeddings = len(embeddings)
+purge_from_memory(embeddings)
+
+np.random.seed(42)
+idxs_permuted = np.random.permutation(n_embeddings)
+
+
 train_set_found = False
 if os.path.exists(works_train_path):
     train_set_length = len(np.load(idxs_train_path))
-    if train_set_length >= TRAIN_SIZE:
+    if train_set_length == TRAIN_SIZE:
         train_set_found = True
 
 if train_set_found:
@@ -55,7 +59,7 @@ else:
     n_embeddings = len(embeddings)
 
     print('Generating train set...')
-    idxs_train = np.random.choice(len(embeddings), size=TRAIN_SIZE, replace=False)
+    idxs_train = idxs_permuted[:TRAIN_SIZE]
     idxs_train = np.sort(idxs_train)
     np.save(idxs_train_path, idxs_train)
 
@@ -104,25 +108,29 @@ def search_routine(idxs_queries_batch):
 queries_set_found = False
 if os.path.exists(idxs_queries_path):
     queries_set_length = len(np.load(idxs_queries_path))
-    if queries_set_length >= TEST_SIZE:
+    if queries_set_length == TEST_SIZE:
         queries_set_found = True
 
-if queries_set_found:
+# The precomputed train set also needs to be valid. If it's not, the precomputed 
+# test and queries sets might be for the wrong slice of idxs_permuted
+if train_set_found and queries_set_found:
     print('Queries test set found, skipping queries and ground truth sets generation...')
 
     idxs_queries = np.load(idxs_queries_path) # expose idxs_queries to the rest of the script
     idxs_gt = np.load(idxs_gt_path) # expose idxs_gt to the rest of the script
 else:
-    print('Queries test set not found or invalid, generating queries and ground truth sets...')
+    # the remaining cases is !T!Q, !TQ, and T!Q, but only !TQ needs a special explanation
+    if not train_set_found and queries_set_found:
+        print('Queries test set might be invalid, generating queries and ground truth sets...')
+    else:
+        print('Queries test set not found or invalid, generating queries and ground truth sets...')
 
     # TODO: right now, search_routine counts in this reference existing, but this reference actually shows up in the 
     #  code AFTER search_routine is defined. This is a confusing design.
     embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
     n_embeddings = len(embeddings)
 
-    idxs = np.arange(n_embeddings)
-    is_in_train = np.isin(idxs, idxs_train)
-    idxs_queries = np.random.choice(idxs[~is_in_train], size=TEST_SIZE, replace=False)
+    idxs_queries = idxs_permuted[TRAIN_SIZE:TRAIN_SIZE+TEST_SIZE]
     idxs_queries = np.sort(idxs_queries)
 
     idxs_queries_batches = np.array_split(idxs_queries, TEST_SIZE//BATCH_SIZE)
