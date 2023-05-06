@@ -44,6 +44,8 @@ if os.path.exists(works_train_path):
 
 if train_set_found:
     print('Valid train set found, skipping train set generation...')
+
+    idxs_train = np.load(idxs_train_path) # expose idxs_train to the rest of the script
 else:
     print('Train set not found or invalid, generating train set...')
 
@@ -106,6 +108,9 @@ if os.path.exists(idxs_queries_path):
 
 if queries_set_found:
     print('Queries test set found, skipping queries and ground truth sets generation...')
+
+    idxs_queries = np.load(idxs_queries_path) # expose idxs_queries to the rest of the script
+    idxs_gt = np.load(idxs_gt_path) # expose idxs_gt to the rest of the script
 else:
     print('Queries test set not found or invalid, generating queries and ground truth sets...')
 
@@ -115,7 +120,6 @@ else:
     n_embeddings = len(embeddings)
 
     idxs = np.arange(n_embeddings)
-    idxs_train = np.load(idxs_train_path)
     is_in_train = np.isin(idxs, idxs_train)
     idxs_queries = np.random.choice(idxs[~is_in_train], size=TEST_SIZE, replace=False)
     idxs_queries = np.sort(idxs_queries)
@@ -172,9 +176,6 @@ faiss.write_index(index, index_path)
 
 
 print('Evaluating index...')
-
-idxs_queries = np.load(idxs_queries_path)
-idxs_gt = np.load(idxs_gt_path)
 
 embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
 embeddings_test = embeddings[idxs_queries].astype(np.float32, copy=True)
