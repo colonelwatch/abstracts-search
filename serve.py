@@ -27,9 +27,9 @@ def generate_pseudodocument(query, api_key):
     parsed_output = None
     attempts_count = 0
     while not parsed_output and attempts_count < 5:
-        raw_output = openai.Completion.create(
-            model='text-davinci-003',
-            prompt=prompt.replace('[REP]', query),
+        raw_output = openai.ChatCompletion.create(
+            model='gpt-3.5-turbo',
+            messages=[{'role': 'user', 'content': prompt.replace('[REP]', query)}],
             # temperature=0.7,
             temperature=1.0,
             max_tokens=300,
@@ -37,7 +37,7 @@ def generate_pseudodocument(query, api_key):
             top_p = 0.95,
             frequency_penalty=0,
             presence_penalty=0
-        ).choices[0].text
+        ).choices[0].message.content
         parsed_output = re.search(
             f'.*\\n(?:T|t)itle ?::? ?(.*)\\n(?:T|t)ext ?::? ?(.*)', 
             raw_output
