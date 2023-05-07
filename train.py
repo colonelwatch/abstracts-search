@@ -15,7 +15,7 @@ TRAIN_SIZE = 4194304
 TEST_SIZE = 131072 # the size of the test set that will be held out until after the index is evaluated
 CHUNK_SIZE = 1048576 # keep at a small number to avoid running out of memory
 D = 384 # dimension of the embeddings
-FACTORY_STRING = 'OPQ32_128,IVF65536,PQ32'
+FACTORY_STRING = 'OPQ64_256,IVF65536,PQ64'
 
 def purge_from_memory(obj):
     del obj
