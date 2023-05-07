@@ -6,6 +6,7 @@ import requests
 from sentence_transformers import SentenceTransformer
 import faiss
 import openai
+from openai.error import APIConnectionError
 import gradio as gr
 
 model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
@@ -27,27 +28,36 @@ def generate_pseudodocument(query, api_key):
     parsed_output = None
     attempts_count = 0
     while not parsed_output and attempts_count < 5:
-        raw_output = openai.ChatCompletion.create(
-            model='gpt-3.5-turbo',
-            messages=[{'role': 'user', 'content': prompt.replace('[REP]', query)}],
-            # temperature=0.7,
-            temperature=1.0,
-            max_tokens=300,
-            # top_p=1,
-            top_p = 0.95,
-            frequency_penalty=0,
-            presence_penalty=0
-        ).choices[0].message.content
+        try:
+            raw_output = openai.ChatCompletion.create(
+                model='gpt-3.5-turbo',
+                messages=[{'role': 'user', 'content': prompt.replace('[REP]', query)}],
+                # temperature=0.7,
+                temperature=1.0,
+                max_tokens=300,
+                # top_p=1,
+                top_p = 0.95,
+                frequency_penalty=0,
+                presence_penalty=0
+            ).choices[0].message.content
+        except APIConnectionError:
+            attempts_count += 1
+            print('Warning: LLM API connection error, retrying...')
+            continue
+
         parsed_output = re.search(
             f'.*\\n(?:T|t)itle ?::? ?(.*)\\n(?:T|t)ext ?::? ?(.*)', 
             raw_output
         )
+
         if not parsed_output:
             attempts_count += 1
             print('Warning: LLM output is not as expected:')
             print('Query:', query)
             print('Raw LLM output:')
             print(raw_output)
+            continue
+
     if not parsed_output:
         raise Exception('Too many attempts to get a valid LLM output')
 
