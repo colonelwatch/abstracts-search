@@ -1,4 +1,4 @@
-name: pseudoabstract-search
+name: abstracts-search
 channels:
   - pytorch
   - nvidia
@@ -173,4 +173,4 @@ dependencies:
       - websockets==11.0.2
       - wrapt==1.15.0
       - yarl==1.9.1
-prefix: /home/kenny/miniconda3/envs/pseudoabstract-search
+prefix: /home/kenny/miniconda3/envs/abstracts-search

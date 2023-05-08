@@ -1,12 +1,9 @@
 # serve.py
 # Loads all completed shards and finds the most similar vector to a given query vector.
 
-import re
 import requests
 from sentence_transformers import SentenceTransformer
 import faiss
-import openai
-from openai.error import APIConnectionError
 import gradio as gr
 
 model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
@@ -20,52 +17,6 @@ ps = faiss.ParameterSpace()
 ps.initialize(index)
 ps.set_index_parameters(index, 'nprobe=32,ht=512')
 
-
-def generate_pseudodocument(query, api_key):
-    openai.api_key = api_key
-    prompt = open('_prompt.md').read()
-
-    parsed_output = None
-    attempts_count = 0
-    while not parsed_output and attempts_count < 5:
-        try:
-            raw_output = openai.ChatCompletion.create(
-                model='gpt-3.5-turbo',
-                messages=[{'role': 'user', 'content': prompt.replace('[REP]', query)}],
-                # temperature=0.7,
-                temperature=1.0,
-                max_tokens=300,
-                # top_p=1,
-                top_p = 0.95,
-                frequency_penalty=0,
-                presence_penalty=0
-            ).choices[0].message.content
-        except APIConnectionError:
-            attempts_count += 1
-            print('Warning: LLM API connection error, retrying...')
-            continue
-
-        parsed_output = re.search(
-            f'.*\\n(?:T|t)itle ?::? ?(.*)\\n(?:T|t)ext ?::? ?(.*)', 
-            raw_output
-        )
-
-        if not parsed_output:
-            attempts_count += 1
-            print('Warning: LLM output is not as expected:')
-            print('Query:', query)
-            print('Raw LLM output:')
-            print(raw_output)
-            continue
-
-    if not parsed_output:
-        raise Exception('Too many attempts to get a valid LLM output')
-
-    title = parsed_output.group(1).strip()
-    text = parsed_output.group(2).strip()
-    document = {'title': title, 'text': text}
-
-    return document
 
 def lookup_openalex_id(idx):
     global idxs
@@ -83,15 +34,10 @@ def recover_abstract(inverted_index):
     abstract = ' '.join(abstract)
     return abstract
 
-def search(query, api_key):
+def search(query):
     global model, index
     
-    pseudodocument = generate_pseudodocument(query, api_key)
-    pseudodocument_string = f'"{pseudodocument["title"]}": {pseudodocument["text"]}'
-    yield pseudodocument_string, 'Loading search results...'
-
-    pseudodocument_probe = f'{pseudodocument["title"]} {pseudodocument["text"]}'
-    query_embedding = model.encode(pseudodocument_probe)
+    query_embedding = model.encode(query)
     query_embedding = query_embedding.reshape(1, -1)
     distances, faiss_ids = index.search(query_embedding, 10)
 
@@ -150,46 +96,27 @@ def search(query, api_key):
             entry_string += f'*DOI: {doi.replace("https://doi.org/", "")}*'
             entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;'
         
-        entry_string += f'*Pseudodocument similarity: {distance:.2f}*'
+        entry_string += f'*Similarity: {distance:.2f}*'
         entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;\n'
 
         result_string += entry_string
 
-        yield pseudodocument_string, result_string
+        yield result_string
 
 with gr.Blocks() as demo:
-    gr.Markdown('# OpenAlex Generative Search Demo')
+    gr.Markdown('# abstracts-search demo')
     gr.Markdown(
-        'Enter your OpenAI API key and a query to search the OpenAlex corpus. '
-        'The demo will use a GPT-3 model to generate a pseudodocument, which '
-        'will then be used to search the OpenAlex corpus. The results will be '
-        'sorted by cosine similarity between the pseudodocument and the abstracts '
-        'of the OpenAlex documents.'
+        'Explore 21 million academic publications selected from the [OpenAlex](https://openalex.org) dataset. This '
+        'project is an index of the embeddings generated from their titles and abstracts. The embeddings were '
+        'generated using the `all-MiniLM-L6-v2` model provided by the [sentence-transformers](https://www.sbert.net/) '
+        'module, and the index was built using the [faiss](https://github.com/facebookresearch/faiss) module.'
     )
-    with gr.Row():
-        with gr.Column():
-            api_key = gr.Textbox(
-                lines=1, 
-                placeholder='Enter your OpenAI API key here', 
-                label='OpenAI API Key'
-            )
-            query = gr.Textbox(
-                lines=2, 
-                placeholder='Enter your query here', 
-                label='Query'
-            )
-        with gr.Column():
-            pseudodocument = gr.Textbox(
-                lines=7, 
-                max_lines=7,
-                placeholder='Awaiting query...', 
-                label='Pseudodocument'
-            )
+    query = gr.Textbox(lines=1, placeholder='Enter your query here', show_label=False)
     btn = gr.Button('Search')
     with gr.Box():
         results = gr.Markdown()
     
-    btn.click(search, inputs=[query, api_key], outputs=[pseudodocument, results])
+    btn.click(search, inputs=[query], outputs=[results])
 
 demo.queue()
 demo.launch()
