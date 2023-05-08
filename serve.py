@@ -18,10 +18,6 @@ ps.initialize(index)
 ps.set_index_parameters(index, 'nprobe=32,ht=512')
 
 
-def lookup_openalex_id(idx):
-    global idxs
-    return idxs[idx]
-
 def recover_abstract(inverted_index):
     abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
 
@@ -35,30 +31,37 @@ def recover_abstract(inverted_index):
     return abstract
 
 def search(query):
-    global model, index
+    global model, index, idxs
     
     query_embedding = model.encode(query)
     query_embedding = query_embedding.reshape(1, -1)
     distances, faiss_ids = index.search(query_embedding, 10)
 
+    distances = distances[0]
+    faiss_ids = faiss_ids[0]
+
+    openalex_ids = [idxs[faiss_id] for faiss_id in faiss_ids]
+    search_filter = f'openalex_id:{"|".join(openalex_ids)}'
+    search_select = 'id,title,abstract_inverted_index,authorships,primary_location,publication_year,cited_by_count,doi'
+    response = requests.get(f'https://api.openalex.org/works?filter={search_filter}&select={search_select}').json()
+    response = {doc['id']: doc for doc in response['results']}
+
     result_string = ''
-    for distance, faiss_id in zip(distances[0], faiss_ids[0]):
-        openalex_id = lookup_openalex_id(faiss_id)
+    for distance, openalex_id in zip(distances, openalex_ids):
+        doc = response[openalex_id]
 
-        response = requests.get(f'https://api.openalex.org/works/{openalex_id}').json()
-
-        # collect attributes from openalex response for the given openalex_id
-        title = response['title']
-        abstract = recover_abstract(response['abstract_inverted_index'])
-        author_names = [authorship['author']['display_name'] for authorship in response['authorships']]
-        # journal_name = response['primary_location']['source']['display_name']
-        publication_year = response['publication_year']
-        citation_count = response['cited_by_count']
-        doi = response['doi']
+        # collect attributes from openalex doc for the given openalex_id
+        title = doc['title']
+        abstract = recover_abstract(doc['abstract_inverted_index'])
+        author_names = [authorship['author']['display_name'] for authorship in doc['authorships']]
+        # journal_name = doc['primary_location']['source']['display_name']
+        publication_year = doc['publication_year']
+        citation_count = doc['cited_by_count']
+        doi = doc['doi']
 
         # try to get journal name or else set it to None
         try:
-            journal_name = response['primary_location']['source']['display_name']
+            journal_name = doc['primary_location']['source']['display_name']
         except (TypeError, KeyError):
             journal_name = None
 
