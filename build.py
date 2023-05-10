@@ -10,7 +10,7 @@ import tqdm
 
 N_GPU_WORKERS = 1
 N_CPU_WORKERS = 4
-CHUNK_SIZE = 2048 # number of works to process at a time
+CHUNK_SIZE = 128 # number of works to process at a time
 D = 384 # dimension of the embeddings
 
 # below are some helper functions
@@ -63,6 +63,8 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
     with works_counter, chunks_reader:
         idxs_chunks = []
         embeddings_chunks = []
+        idxs_chunk = []
+        documents_chunk = []
         for works_chunk in chunks_reader:
             works_chunk = works_chunk[ \
                 (works_chunk['abstract_inverted_index'].notnull()) & \
@@ -70,12 +72,6 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
             ] # filter out works with no abstract early to save time and memory
             works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']] # also drop all other columns to save memory
 
-            if len(works_chunk) == 0: # if that leads to an empty chunk, bypass the below code
-                continue
-
-            # filter out works that aren't english-language
-            idxs_chunk = []
-            documents_chunk = []
             for _, row in works_chunk.iterrows():
                 idx = row['id']
                 document = build_document(row)
@@ -86,9 +82,24 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
                 if __label__lang == '__label__en':
                     idxs_chunk.append(idx)
                     documents_chunk.append(document)
+            
+            if len(idxs_chunk) > CHUNK_SIZE:
+                assert len(idxs_chunk) == len(documents_chunk)
 
-            if len(idxs_chunk) == 0: # if that leads to an empty chunk, bypass the below code
-                continue
+                # build the idxs and embeddings for this chunk
+                model_in_queue.put((documents_chunk, i_cpu))
+                embeddings_chunk = model_out_queue.get()
+
+                idxs_chunks.append(idxs_chunk)
+                embeddings_chunks.append(embeddings_chunk)
+
+                works_counter.update(len(idxs_chunk))
+                idxs_chunk = []
+                documents_chunk = []
+
+        # build the idxs and embeddings for the last chunk
+        if len(idxs_chunk) > 0:
+            assert len(idxs_chunk) == len(documents_chunk)
 
             # build the idxs and embeddings for this chunk
             model_in_queue.put((documents_chunk, i_cpu))
@@ -97,7 +108,7 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
             idxs_chunks.append(idxs_chunk)
             embeddings_chunks.append(embeddings_chunk)
 
-            works_counter.update(len(idxs_chunks))
+            works_counter.update(len(idxs_chunk))
     
     idxs = []
     for idxs_chunk in idxs_chunks:
