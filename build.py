@@ -9,8 +9,8 @@ from multiprocessing import Process, Pool, Manager
 import tqdm
 
 N_GPU_WORKERS = 1
-N_CPU_WORKERS = 4
-CHUNK_SIZE = 128 # number of works to process at a time
+N_CPU_WORKERS = 6
+CHUNK_SIZE = 1024 # number of works to process at a time
 D = 384 # dimension of the embeddings
 
 # below are some helper functions
@@ -48,7 +48,7 @@ def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is
     model = SentenceTransformer('all-MiniLM-L6-v2', device=f'cuda:{i_gpu}').half()
     while True:
         documents, i_cpu = in_queue.get()
-        embeddings = model.encode(documents, show_progress_bar=False)
+        embeddings = model.encode(documents, batch_size=128, show_progress_bar=False)
         out_queues[i_cpu].put(embeddings)
 
 # the below code tries to replicate the following SQL query:
