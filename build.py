@@ -45,6 +45,8 @@ def build_document(row):
         return recover_abstract(row['abstract_inverted_index'])
 
 def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is sent out on out_queues[i_cpu]
+    os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
+    
     model = SentenceTransformer('all-MiniLM-L6-v2', device=f'cuda:{i_gpu}').half()
     while True:
         documents, i_cpu = in_queue.get()
@@ -57,6 +59,8 @@ def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is
 # AND abstract_inverted_index IS NOT NULL AND abstract_inverted_index::text 
 # <> '{}';
 def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue):
+    os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
+    
     lang_detector = FastText('lid.176.bin')
     works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
     chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
