@@ -3,6 +3,7 @@ import shutil
 import requests
 import numpy as np
 import pandas as pd
+from fasttext.FastText import _FastText as FastText # importing this way to bypass a forced print to stderr
 from sentence_transformers import SentenceTransformer
 from multiprocessing import Process, Pool, Manager
 import tqdm
@@ -56,6 +57,7 @@ def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is
 # AND abstract_inverted_index IS NOT NULL AND abstract_inverted_index::text 
 # <> '{}';
 def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue):
+    lang_detector = FastText('lid.176.bin')
     works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
     chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
     with works_counter, chunks_reader:
@@ -66,22 +68,29 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
                 (works_chunk['abstract_inverted_index'].notnull()) & \
                 (works_chunk['abstract_inverted_index'].astype(str) != '{}') \
             ] # filter out works with no abstract early to save time and memory
+            works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']] # also drop all other columns to save memory
 
             if len(works_chunk) == 0: # if that leads to an empty chunk, bypass the below code
                 continue
 
-            source_id_column = works_chunk.apply(infer_source_id, axis=1)
-            works_chunk = works_chunk.assign(source_id=source_id_column)
-            works_chunk = pd.merge(works_chunk, src_ctry_table, left_on='source_id', right_on='id', suffixes=(None, '_source'))
-            works_chunk = works_chunk[works_chunk['country_code'] == 'US']
-            works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']]
+            # filter out works that aren't english-language
+            idxs_chunk = []
+            documents_chunk = []
+            for _, row in works_chunk.iterrows():
+                idx = row['id']
+                document = build_document(row)
 
-            if len(works_chunk) == 0: # if that leads to an empty chunk, bypass the below code
+                cleaned_document = document.replace('\n', '').replace('\r', '') # FastText doesn't accept newlines
+                __label__lang = lang_detector.predict(cleaned_document)[0][0]
+
+                if __label__lang == '__label__en':
+                    idxs_chunk.append(idx)
+                    documents_chunk.append(document)
+
+            if len(idxs_chunk) == 0: # if that leads to an empty chunk, bypass the below code
                 continue
 
             # build the idxs and embeddings for this chunk
-            idxs_chunk = works_chunk['id'].to_list()
-            documents_chunk = [build_document(row) for _, row in works_chunk.iterrows()]
             model_in_queue.put((documents_chunk, i_cpu))
             embeddings_chunk = model_out_queue.get()
 
@@ -107,22 +116,6 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
     return len(idxs) # return the number of works processed
 
 if __name__ == '__main__':
-    # Download the sources table and generate a source_id -> country_code mapping
-    print('Downloading sources table...')
-    shards_manifest = requests.get('https://openalex.s3.amazonaws.com/data/sources/manifest').json()
-    shards_urls = [entry['url'] for entry in shards_manifest['entries']]
-
-    shards = []
-    for shard_url in tqdm.tqdm(shards_urls):
-        shard_url = shard_url.replace('s3://openalex', 'https://openalex.s3.amazonaws.com')
-        shard = pd.read_json(shard_url, lines=True)
-        shards.append(shard)
-    sources_table = pd.concat(shards)
-
-    print('Generating source_id -> country_code table...')
-    src_ctry_table = sources_table[['id', 'country_code']]
-
-
     # Identify the state of the works table
     if os.path.exists('abstracts-embeddings/idxs.txt') and os.path.exists('abstracts-embeddings/embeddings.memmap'):
         print('Completed works table found, exiting...')
@@ -139,6 +132,11 @@ if __name__ == '__main__':
         last_downloaded_url = None
         shutil.rmtree('partial_works', ignore_errors=True)
         os.makedirs('partial_works')
+
+    # if lid.176.bin doesn't exist, download it
+    if not os.path.exists('lid.176.bin'):
+        print('Downloading FastText language detector...')
+        os.system('wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin')
 
 
     # Compare the checkpoint to the works manifest to determine which works to download
