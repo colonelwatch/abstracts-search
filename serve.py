@@ -133,6 +133,9 @@ with gr.Blocks() as demo:
     with gr.Box():
         results = gr.Markdown()
     
+    query.submit(search, inputs=[query], outputs=[neighbors_var, request_str_var]) \
+        .success(execute_request, inputs=[request_str_var], outputs=[response_var]) \
+        .success(format_response, inputs=[neighbors_var, response_var], outputs=[results])
     btn.click(search, inputs=[query], outputs=[neighbors_var, request_str_var]) \
         .success(execute_request, inputs=[request_str_var], outputs=[response_var]) \
         .success(format_response, inputs=[neighbors_var, response_var], outputs=[results])
