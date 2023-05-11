@@ -18,7 +18,7 @@ ps.initialize(index)
 ps.set_index_parameters(index, 'nprobe=32,ht=512')
 
 
-def recover_abstract(inverted_index):
+def _recover_abstract(inverted_index):
     abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
 
     abstract = [None]*abstract_size
@@ -32,7 +32,7 @@ def recover_abstract(inverted_index):
 
 def search(query):
     global model, index, idxs
-    
+
     query_embedding = model.encode(query)
     query_embedding = query_embedding.reshape(1, -1)
     distances, faiss_ids = index.search(query_embedding, 10)
@@ -43,16 +43,26 @@ def search(query):
     openalex_ids = [idxs[faiss_id] for faiss_id in faiss_ids]
     search_filter = f'openalex_id:{"|".join(openalex_ids)}'
     search_select = 'id,title,abstract_inverted_index,authorships,primary_location,publication_year,cited_by_count,doi'
-    response = requests.get(f'https://api.openalex.org/works?filter={search_filter}&select={search_select}').json()
-    response = {doc['id']: doc for doc in response['results']}
 
+    neighbors = [(distance, openalex_id) for distance, openalex_id in zip(distances, openalex_ids)]
+    request_str = f'https://api.openalex.org/works?filter={search_filter}&select={search_select}'
+
+    return neighbors, request_str
+
+def execute_request(request_str):
+    response = requests.get(request_str).json()
+    return response
+
+def format_response(neighbors, response):
+    response = {doc['id']: doc for doc in response['results']}
+    
     result_string = ''
-    for distance, openalex_id in zip(distances, openalex_ids):
+    for distance, openalex_id in neighbors:
         doc = response[openalex_id]
 
         # collect attributes from openalex doc for the given openalex_id
         title = doc['title']
-        abstract = recover_abstract(doc['abstract_inverted_index'])
+        abstract = _recover_abstract(doc['abstract_inverted_index'])
         author_names = [authorship['author']['display_name'] for authorship in doc['authorships']]
         # journal_name = doc['primary_location']['source']['display_name']
         publication_year = doc['publication_year']
@@ -103,8 +113,8 @@ def search(query):
         entry_string += '&nbsp;&nbsp;&nbsp;&nbsp;\n'
 
         result_string += entry_string
-
-        yield result_string
+    
+    return result_string
 
 with gr.Blocks() as demo:
     gr.Markdown('# abstracts-search demo')
@@ -114,12 +124,18 @@ with gr.Blocks() as demo:
         'generated using the `all-MiniLM-L6-v2` model provided by the [sentence-transformers](https://www.sbert.net/) '
         'module, and the index was built using the [faiss](https://github.com/facebookresearch/faiss) module.'
     )
+
+    neighbors_var = gr.State()
+    request_str_var = gr.State()
+    response_var = gr.State()
     query = gr.Textbox(lines=1, placeholder='Enter your query here', show_label=False)
     btn = gr.Button('Search')
     with gr.Box():
         results = gr.Markdown()
     
-    btn.click(search, inputs=[query], outputs=[results])
+    btn.click(search, inputs=[query], outputs=[neighbors_var, request_str_var]) \
+        .success(execute_request, inputs=[request_str_var], outputs=[response_var]) \
+        .success(format_response, inputs=[neighbors_var, response_var], outputs=[results])
 
 demo.queue()
 demo.launch()
