@@ -136,6 +136,10 @@ if __name__ == '__main__':
         print('Completed works table found, exiting...')
 
         exit()
+    elif os.path.exists('abstracts-embeddings/idxs_000.txt') and os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
+        print('Completed works table found, but it is split into chunks. Have you called "cat embeddings_*.memmap > embeddings.memmap"? Exiting...')
+
+        exit()
     elif os.path.exists('partial_works/checkpoint.txt'):
         print('Partial works table found, resuming works download...')
 

@@ -6,16 +6,16 @@
 import os
 import numpy as np
 import torch
-from tqdm import trange
+from tqdm import tqdm, trange
 from tqdm.contrib.concurrent import thread_map
 import faiss
 import gc
 
 TRAIN_SIZE = 4194304
-TEST_SIZE = 131072 # the size of the test set that will be held out until after the index is evaluated
+TEST_SIZE = 16384 # the size of the test set that will be held out until after the index is evaluated
 CHUNK_SIZE = 1048576 # keep at a small number to avoid running out of memory
 D = 384 # dimension of the embeddings
-FACTORY_STRING = 'OPQ64_256,IVF65536,PQ64'
+FACTORY_STRING = 'OPQ48_192,IVF65536,PQ48'
 
 def purge_from_memory(obj):
     del obj
@@ -27,9 +27,15 @@ works_train_path = 'abstracts-embeddings/train/train.memmap'
 idxs_train_path = 'abstracts-embeddings/train/idxs_train.npy'
 idxs_queries_path = 'abstracts-embeddings/train/idxs_queries.npy'
 idxs_gt_path = 'abstracts-embeddings/train/idxs_gt.npy'
-index_path = 'abstracts-embeddings/index.faiss'
+index_path = 'abstracts-index/index.faiss'
 
 os.makedirs('abstracts-embeddings/train', exist_ok=True)
+
+
+if not os.path.exists(works_path) and os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
+    print('Embeddings found, but it is split into chunks. Have you called "cat embeddings_*.memmap > embeddings.memmap"? Exiting...')
+
+    exit()
 
 
 # The sampling should be random, so we'll use a reproducible shuffle to do it
@@ -165,7 +171,7 @@ embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
 n_embeddings = len(embeddings)
 purge_from_memory(embeddings)
 
-index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
+temp_index_gpu = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
 for i in trange(len(embeddings)//CHUNK_SIZE+1):
     offset = i*CHUNK_SIZE
     shape = (min(CHUNK_SIZE, n_embeddings-offset), D)
@@ -178,10 +184,12 @@ for i in trange(len(embeddings)//CHUNK_SIZE+1):
     faiss_ids = faiss_ids[~in_test_set]
     shard = shard[~in_test_set]
 
-    index.add_with_ids(shard, faiss_ids)
+    temp_index_gpu.add_with_ids(shard, faiss_ids)
+    temp_index = faiss.index_gpu_to_cpu(temp_index_gpu)
+    index.merge_from(temp_index)
+    
+    temp_index_gpu.reset()
     purge_from_memory(shard)
-index = faiss.index_gpu_to_cpu(index)
-faiss.write_index(index, index_path)
 
 
 print('Evaluating index...')
@@ -207,3 +215,11 @@ index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
 index.add_with_ids(embeddings_test, idxs_queries)
 index = faiss.index_gpu_to_cpu(index)
 faiss.write_index(index, index_path)
+
+
+print('Copying idxs.txt to abstracts-index...')
+lines_counter = tqdm(total=n_embeddings, desc='lines copied')
+with open('abstracts-embeddings/idxs.txt', 'r') as f, open('abstracts-index/idxs.txt', 'w') as g:
+    for line in f:
+        lines_counter.update()
+        g.write(line)
