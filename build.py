@@ -6,6 +6,7 @@ import pandas as pd
 from fasttext.FastText import _FastText as FastText # importing this way to bypass a forced print to stderr
 from sentence_transformers import SentenceTransformer
 from multiprocessing import Process, Pool, Manager
+from itertools import repeat
 import tqdm
 
 N_GPU_WORKERS = 1
@@ -47,8 +48,11 @@ def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is
 # works.primary_location.id = sources.id WHERE sources.country_code = 'US' 
 # AND abstract_inverted_index IS NOT NULL AND abstract_inverted_index::text 
 # <> '{}';
-def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue):
+def works_url_routine(args):
+    i_task, works_url, model_in_queue, model_out_queues = args
+    
     os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
+    i_cpu = i_task%N_CPU_WORKERS # infer a unique CPU id from i_task (valid approach as long as we use the pool.imap)
     
     lang_detector = FastText('lid.176.bin')
     works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
@@ -56,15 +60,14 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
     with works_counter, chunks_reader:
         idxs_chunks = []
         embeddings_chunks = []
-        idxs_chunk = []
-        documents_chunk = []
         for works_chunk in chunks_reader:
-            works_chunk = works_chunk[ \
-                (works_chunk['abstract_inverted_index'].notnull()) & \
-                (works_chunk['abstract_inverted_index'].astype(str) != '{}') \
-            ] # filter out works with no abstract early to save time and memory
-            works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']] # also drop all other columns to save memory
+            # drop unnecessary columns and works with no abstract early to save time and memory
+            works_chunk = works_chunk[works_chunk['abstract_inverted_index'].notnull()]
+            works_chunk = works_chunk[(works_chunk['abstract_inverted_index'].astype(str) != '{}')]
+            works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']]
 
+            idxs_chunk = []
+            documents_chunk = []
             for _, row in works_chunk.iterrows():
                 idx = row['id']
                 document = build_document(row)
@@ -76,31 +79,15 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
                     idxs_chunk.append(idx)
                     documents_chunk.append(document)
             
-            if len(idxs_chunk) > CHUNK_SIZE:
-                assert len(idxs_chunk) == len(documents_chunk)
-
-                # build the idxs and embeddings for this chunk
-                model_in_queue.put((documents_chunk, i_cpu))
-                embeddings_chunk = model_out_queue.get()
-
-                idxs_chunks.append(idxs_chunk)
-                embeddings_chunks.append(embeddings_chunk)
-
-                works_counter.update(len(idxs_chunk))
-                idxs_chunk = []
-                documents_chunk = []
-
-        # build the idxs and embeddings for the last chunk
-        if len(idxs_chunk) > 0:
-            assert len(idxs_chunk) == len(documents_chunk)
-
+            if len(idxs_chunk) == 0:
+                continue
+            
             # build the idxs and embeddings for this chunk
             model_in_queue.put((documents_chunk, i_cpu))
-            embeddings_chunk = model_out_queue.get()
+            embeddings_chunk = model_out_queues[i_cpu].get()
 
             idxs_chunks.append(idxs_chunk)
             embeddings_chunks.append(embeddings_chunk)
-
             works_counter.update(len(idxs_chunk))
     
     idxs = []
@@ -153,7 +140,6 @@ if __name__ == '__main__':
 
     i_last_completed_task = works_urls.index(last_downloaded_url) if last_downloaded_url else -1
     i_next_task = i_last_completed_task+1
-    n_tasks_remaining = len(works_urls)-i_next_task
 
 
     work_urls_counter = tqdm.tqdm(desc='work_urls', initial=i_next_task, total=len(works_urls), position=0)
@@ -167,35 +153,15 @@ if __name__ == '__main__':
         for i_gpu in range(N_GPU_WORKERS):
             model_workers[i_gpu].start()
 
-        # assign the first N_CPU_WORKERS tasks unless there are fewer than N_CPU_WORKERS tasks
-        work_futures = [None]*N_CPU_WORKERS
-        for i_cpu in range(min(n_tasks_remaining, N_CPU_WORKERS)):
-            work_futures[i_cpu] = pool.apply_async(
-                works_url_routine, 
-                (i_cpu, i_next_task, works_urls[i_next_task], model_in_queue, model_out_queues[i_cpu])
-            )
-            i_next_task += 1
-        
-        i_cpu = 0
-        while n_tasks_remaining > 0:
-            n_abstracts = work_futures[i_cpu].get() # wait for the next result to come in
-            n_tasks_remaining -= 1
+        i_iter = range(i_next_task, len(works_urls))
+        model_in_queue_iter = repeat(model_in_queue) # queues aren't pickleable, but they can be passed as an arg
+        model_out_queues_iter = repeat(model_out_queues)
+        args_iter = zip(i_iter, works_urls[i_next_task:], model_in_queue_iter, model_out_queues_iter)
+        for n_works in pool.imap(works_url_routine, args_iter):
             i_last_completed_task += 1
-
-            # update progress bars and checkpoint
             work_urls_counter.update(1)
             with open('partial_works/checkpoint.txt', 'w') as f:
                 f.write(works_urls[i_last_completed_task])
-            
-            # if all remaining tasks have been assigned, don't assign more
-            if i_next_task < len(works_urls):
-                work_futures[i_cpu] = pool.apply_async(
-                    works_url_routine, 
-                    (i_cpu, i_next_task, works_urls[i_next_task], model_in_queue, model_out_queues[i_cpu])
-                )
-                i_next_task += 1
-
-            i_cpu = (i_cpu+1)%N_CPU_WORKERS
         
         for i_gpu in range(N_GPU_WORKERS):
             model_workers[i_gpu].terminate()
