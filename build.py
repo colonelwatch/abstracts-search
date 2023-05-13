@@ -15,17 +15,6 @@ D = 384 # dimension of the embeddings
 
 # below are some helper functions
 
-def infer_source_id(row):
-    try:
-        source_object = row['primary_location']
-        return source_object['id']
-    except (TypeError, KeyError): # row['primary_location'] may be NaN or a dict without an 'id' key
-        try:
-            source_object = row['host_venue']
-            return source_object['id']
-        except (TypeError, KeyError):
-            return None
-
 def recover_abstract(inverted_index):
     abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
 
@@ -132,11 +121,11 @@ def works_url_routine(i_cpu, i_task, works_url, model_in_queue, model_out_queue)
 
 if __name__ == '__main__':
     # Identify the state of the works table
-    if os.path.exists('abstracts-embeddings/idxs.txt') and os.path.exists('abstracts-embeddings/embeddings.memmap'):
+    if os.path.exists('abstracts-embeddings/embeddings.memmap'):
         print('Completed works table found, exiting...')
 
         exit()
-    elif os.path.exists('abstracts-embeddings/idxs_000.txt') and os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
+    elif os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
         print('Completed works table found, but it is split into chunks. Have you called "cat embeddings_*.memmap > embeddings.memmap"? Exiting...')
 
         exit()
