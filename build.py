@@ -14,9 +14,7 @@ N_CPU_WORKERS = 6
 CHUNK_SIZE = 1024 # number of works to process at a time
 D = 384 # dimension of the embeddings
 
-# below are some helper functions
-
-def recover_abstract(inverted_index):
+def _recover_abstract(inverted_index):
     abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
 
     abstract = [None]*abstract_size
@@ -28,11 +26,11 @@ def recover_abstract(inverted_index):
     abstract = ' '.join(abstract)
     return abstract
 
-def build_document(row):
+def _build_document(row):
     if row['title']:
-        return f'{row["title"]} {recover_abstract(row["abstract_inverted_index"])}'
+        return f'{row["title"]} {_recover_abstract(row["abstract_inverted_index"])}'
     else:
-        return recover_abstract(row['abstract_inverted_index'])
+        return _recover_abstract(row['abstract_inverted_index'])
 
 def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is sent out on out_queues[i_cpu]
     os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
@@ -43,23 +41,19 @@ def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is
         embeddings = model.encode(documents, batch_size=128, show_progress_bar=False)
         out_queues[i_cpu].put(embeddings)
 
-# the below code tries to replicate the following SQL query:
-# SELECT id, title, abstract_inverted_index FROM works INNER JOIN sources ON 
-# works.primary_location.id = sources.id WHERE sources.country_code = 'US' 
-# AND abstract_inverted_index IS NOT NULL AND abstract_inverted_index::text 
-# <> '{}';
 def works_url_routine(args):
-    i_task, works_url, model_in_queue, model_out_queues = args
-    
     os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
-    i_cpu = i_task%N_CPU_WORKERS # infer a unique CPU id from i_task (valid approach as long as we use the pool.imap)
     
+    i_task, works_url, model_in_queue, model_out_queues = args
+    i_cpu = i_task%N_CPU_WORKERS # infer a unique CPU id from i_task (valid approach as long as we use the pool.imap)
+       
+    idxs_chunks = []
+    embeddings_chunks = []
+
     lang_detector = FastText('lid.176.bin')
     works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
     chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
     with works_counter, chunks_reader:
-        idxs_chunks = []
-        embeddings_chunks = []
         for works_chunk in chunks_reader:
             # drop unnecessary columns and works with no abstract early to save time and memory
             works_chunk = works_chunk[works_chunk['abstract_inverted_index'].notnull()]
@@ -70,7 +64,7 @@ def works_url_routine(args):
             documents_chunk = []
             for _, row in works_chunk.iterrows():
                 idx = row['id']
-                document = build_document(row)
+                document = _build_document(row)
 
                 cleaned_document = document.replace('\n', '').replace('\r', '') # FastText doesn't accept newlines
                 __label__lang = lang_detector.predict(cleaned_document)[0][0]
@@ -90,14 +84,9 @@ def works_url_routine(args):
             embeddings_chunks.append(embeddings_chunk)
             works_counter.update(len(idxs_chunk))
     
-    idxs = []
-    for idxs_chunk in idxs_chunks:
-        idxs.extend(idxs_chunk)
-
-    if len(embeddings_chunks) == 0:
-        embeddings = np.empty((0, D), dtype=np.float16)
-    else:
-        embeddings = np.vstack(embeddings_chunks)
+    # merge all the idxs and embeddings chunks into a single list and array
+    idxs = sum(idxs_chunks, []) # flatten the list of lists
+    embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)
 
     # save the idxs and embeddings built from this chunk to the disk
     np.save(f'partial_works/embeddings_{i_task}.npy', embeddings)
@@ -110,15 +99,12 @@ if __name__ == '__main__':
     # Identify the state of the works table
     if os.path.exists('abstracts-embeddings/embeddings.memmap'):
         print('Completed works table found, exiting...')
-
         exit()
     elif os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
         print('Completed works table found, but it is split into chunks. Have you called "cat embeddings_*.memmap > embeddings.memmap"? Exiting...')
-
         exit()
     elif os.path.exists('partial_works/checkpoint.txt'):
         print('Partial works table found, resuming works download...')
-
         with open('partial_works/checkpoint.txt') as f:
             last_downloaded_url = f.read()
     else:
