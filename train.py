@@ -9,13 +9,14 @@ import torch
 from tqdm import tqdm, trange
 from tqdm.contrib.concurrent import thread_map
 import faiss
+from faiss.contrib.ondisk import merge_ondisk
 import gc
 
 TRAIN_SIZE = 4194304
 TEST_SIZE = 16384 # the size of the test set that will be held out until after the index is evaluated
 CHUNK_SIZE = 1048576 # keep at a small number to avoid running out of memory
 D = 384 # dimension of the embeddings
-FACTORY_STRING = 'OPQ48_192,IVF65536,PQ48'
+FACTORY_STRING = 'OPQ64_256,IVF65536,PQ64'
 
 def purge_from_memory(obj):
     del obj
@@ -28,8 +29,10 @@ idxs_train_path = 'abstracts-embeddings/train/idxs_train.npy'
 idxs_queries_path = 'abstracts-embeddings/train/idxs_queries.npy'
 idxs_gt_path = 'abstracts-embeddings/train/idxs_gt.npy'
 index_path = 'abstracts-index/index.faiss'
+ivfdata_path = 'abstracts-index/index.ivfdata'
 
 os.makedirs('abstracts-embeddings/train', exist_ok=True)
+os.makedirs('partial_indices', exist_ok=True)
 
 
 if not os.path.exists(works_path) and os.path.exists('abstracts-embeddings/embeddings_000.memmap'):
@@ -164,6 +167,8 @@ index.train(embeddings_train)
 index = faiss.index_gpu_to_cpu(index)
 purge_from_memory(embeddings_train)
 
+faiss.write_index(index, 'partial_indices/empty.faiss')
+
 
 print('Adding embeddings (except the test set) to trained index...')
 
@@ -186,10 +191,19 @@ for i in trange(len(embeddings)//CHUNK_SIZE+1):
 
     temp_index_gpu.add_with_ids(shard, faiss_ids)
     temp_index = faiss.index_gpu_to_cpu(temp_index_gpu)
-    index.merge_from(temp_index)
+    faiss.write_index(temp_index, f'partial_indices/index_{i:03d}.faiss')
     
     temp_index_gpu.reset()
     purge_from_memory(shard)
+
+partial_index_paths = [f'partial_indices/index_{i:03d}.faiss' for i in range(len(embeddings)//CHUNK_SIZE+1)]
+
+index = faiss.read_index('partial_indices/empty.faiss')
+merge_ondisk(index, partial_index_paths, ivfdata_path.replace('abstracts-index/', ''))
+faiss.write_index(index, index_path)
+
+purge_from_memory(temp_index_gpu)
+purge_from_memory(temp_index)
 
 
 print('Evaluating index...')
@@ -201,7 +215,6 @@ purge_from_memory(embeddings) # after getting the test set, we don't need the wh
 tuning_criterion = faiss.IntersectionCriterion(TEST_SIZE, 10)
 tuning_criterion.set_groundtruth(None, idxs_gt)
 
-index = faiss.read_index(index_path)
 param_space = faiss.ParameterSpace()
 param_space.initialize(index)
 param_values = param_space.explore(index, embeddings_test, tuning_criterion)
@@ -210,10 +223,14 @@ param_values.display()
 
 
 print('Adding test set to index...')
-index = faiss.read_index(index_path)
-index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
-index.add_with_ids(embeddings_test, idxs_queries)
-index = faiss.index_gpu_to_cpu(index)
+
+partial_test_index = faiss.read_index('partial_indices/empty.faiss')
+partial_test_index.add_with_ids(embeddings_test, idxs_queries)
+faiss.write_index(partial_test_index, 'partial_indices/index_test.faiss')
+partial_index_paths.append('partial_indices/index_test.faiss')
+
+index = faiss.read_index('partial_indices/empty.faiss')
+merge_ondisk(index, partial_index_paths, ivfdata_path.replace('abstracts-index/', ''))
 faiss.write_index(index, index_path)
 
 
@@ -223,3 +240,6 @@ with open('abstracts-embeddings/idxs.txt', 'r') as f, open('abstracts-index/idxs
     for line in f:
         lines_counter.update()
         g.write(line)
+
+print('Migrating ivfdata to abstracts-index...')
+os.rename(ivfdata_path.replace('abstracts-index/', ''), ivfdata_path)
