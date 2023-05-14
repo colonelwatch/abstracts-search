@@ -82,37 +82,7 @@ else:
     purge_from_memory(embeddings)
 
 
-BATCH_SIZE = 4096
 N_VECTORS_COMPARED = 65536
-def search_routine(idxs_queries_batch):
-    embeddings_test_batch = embeddings[idxs_queries_batch]
-    embeddings_test_batch = torch.from_numpy(embeddings_test_batch).cuda()
-    
-    top_10_scores_batch = np.zeros((BATCH_SIZE, 10), dtype=np.float16)
-    top_10_idxs_batch = np.empty((BATCH_SIZE, 10), dtype=np.int64)
-    for j in range(0, n_embeddings, N_VECTORS_COMPARED):
-        idxs_chunk = np.arange(j, min(j+N_VECTORS_COMPARED, n_embeddings))
-        in_test_set = np.isin(idxs_chunk, idxs_queries_batch)
-        idxs_chunk = idxs_chunk[~in_test_set]
-
-        embeddings_chunk = torch.from_numpy(embeddings[idxs_chunk]).cuda()
-        scores_batch_chunk = embeddings_test_batch @ embeddings_chunk.T
-
-        top_10_scores_batch_chunk, arg_top_10_scores_batch_chunk = torch.topk(scores_batch_chunk, 10, dim=1, largest=True)
-        top_10_scores_batch_chunk = top_10_scores_batch_chunk.cpu().numpy()
-        top_10_idxs_batch_chunk = idxs_chunk[arg_top_10_scores_batch_chunk.cpu().numpy()]
-
-        for i in range(BATCH_SIZE):
-            scores = np.hstack((top_10_scores_batch[i], top_10_scores_batch_chunk[i]))
-            idxs = np.hstack((top_10_idxs_batch[i], top_10_idxs_batch_chunk[i]))
-
-            top_10_filter = np.argsort(scores)[10:]
-            top_10_filter = top_10_filter[::-1]
-
-            top_10_scores_batch[i] = scores[top_10_filter]
-            top_10_idxs_batch[i] = idxs[top_10_filter]
-    
-    return top_10_idxs_batch
 
 queries_set_found = False
 if os.path.exists(idxs_queries_path):
@@ -134,17 +104,37 @@ else:
     else:
         print('Queries test set not found or invalid, generating queries and ground truth sets...')
 
-    # TODO: right now, search_routine counts in this reference existing, but this reference actually shows up in the 
-    #  code AFTER search_routine is defined. This is a confusing design.
     embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
     n_embeddings = len(embeddings)
 
     idxs_queries = idxs_permuted[TRAIN_SIZE:TRAIN_SIZE+TEST_SIZE]
     idxs_queries = np.sort(idxs_queries)
+    embeddings_queries = embeddings[idxs_queries].copy()
+    embeddings_queries = torch.from_numpy(embeddings_queries).cuda()
 
-    idxs_queries_batches = np.array_split(idxs_queries, TEST_SIZE//BATCH_SIZE)
-    idxs_gt_batches = thread_map(search_routine, idxs_queries_batches, max_workers=3, desc='query batches')
-    idxs_gt = np.vstack(idxs_gt_batches)
+    scores_gt = np.zeros((TEST_SIZE, 10), dtype=np.float16)
+    idxs_gt = np.empty((TEST_SIZE, 10), dtype=np.int64)
+    for i in trange(0, n_embeddings, N_VECTORS_COMPARED): 
+        idxs_chunk = np.arange(i, min(i+N_VECTORS_COMPARED, n_embeddings))
+        in_test_set = np.isin(idxs_chunk, idxs_queries)
+        idxs_chunk = idxs_chunk[~in_test_set]
+
+        embeddings_chunk = torch.from_numpy(embeddings[idxs_chunk]).cuda()
+        scores_chunk = embeddings_queries @ embeddings_chunk.T
+
+        scores_gt_chunk, arg_scores_gt_chunk = torch.topk(scores_chunk, 10, dim=1, largest=True)
+        scores_gt_chunk = scores_gt_chunk.cpu().numpy()
+        idxs_gt_chunk = idxs_chunk[arg_scores_gt_chunk.cpu().numpy()]
+
+        for j in range(TEST_SIZE):
+            scores = np.hstack((scores_gt[j], scores_gt_chunk[j]))
+            idxs = np.hstack((idxs_gt[j], idxs_gt_chunk[j]))
+
+            top_10_filter = np.argsort(scores)[10:]
+            top_10_filter = top_10_filter[::-1]
+
+            scores_gt[j] = scores[top_10_filter]
+            idxs_gt[j] = idxs[top_10_filter]
 
     np.save(idxs_queries_path, idxs_queries)
     np.save(idxs_gt_path, idxs_gt)
