@@ -11,11 +11,11 @@ import faiss
 from faiss.contrib.ondisk import merge_ondisk
 import gc
 
-TRAIN_SIZE = 4194304
+TRAIN_SIZE = 6291456 # TODO: can't seem to push past 6291456 without hangups
 TEST_SIZE = 16384 # the size of the test set that will be held out until after the index is evaluated
 CHUNK_SIZE = 1048576 # keep at a small number to avoid running out of memory
 D = 384 # dimension of the embeddings
-FACTORY_STRING = 'OPQ64_256,IVF65536,PQ64'
+FACTORY_STRING = 'OPQ64_256,IVF131072,PQ64'
 
 def purge_from_memory(obj):
     del obj
