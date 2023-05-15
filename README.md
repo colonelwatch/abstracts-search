@@ -37,14 +37,15 @@ git lfs install
 
 git clone https://github.com/colonelwatch/abstracts-search
 
-git submodule update --remote abstracts-embeddings
 env CC=gcc-12 conda env create -f environment.yml
 conda activate abstracts-search
+
+git submodule update --init abstracts-embeddings
 cd abstracts-embeddings
 cat embeddings_*.memmap > embeddings.memmap
 cd ..
 
-env GIT_LFS_SKIP_SMUDGE=1 git submodule update --remote abstracts-index
+env GIT_LFS_SKIP_SMUDGE=1 git submodule update --init abstracts-index
 python train.py
 ```
 
@@ -55,12 +56,14 @@ git lfs install
 
 git clone https://github.com/colonelwatch/abstracts-search
 
-env GIT_LFS_SKIP_SMUDGE=1 git submodule update --remote abstracts-embeddings
 env CC=gcc-12 conda env create -f environment.yml
 conda activate abstracts-search
-cd ..
+
+env GIT_LFS_SKIP_SMUDGE=1 git submodule update --init abstracts-embeddings
+rm abstracts-embeddings/embeddings_*.memmap
+rm abstracts-embeddings/openalex_ids.txt
 python build.py
 
-env GIT_LFS_SKIP_SMUDGE=1 git submodule update --remote abstracts-index
+env GIT_LFS_SKIP_SMUDGE=1 git submodule update --init abstracts-index
 python train.py
 ```
