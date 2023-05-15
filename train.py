@@ -23,14 +23,14 @@ def purge_from_memory(obj):
 
 
 works_path = 'abstracts-embeddings/embeddings.memmap'
-works_train_path = 'abstracts-embeddings/train/train.memmap'
-idxs_train_path = 'abstracts-embeddings/train/idxs_train.npy'
-idxs_queries_path = 'abstracts-embeddings/train/idxs_queries.npy'
-idxs_gt_path = 'abstracts-embeddings/train/idxs_gt.npy'
+works_train_path = 'train_work/train.memmap'
+idxs_train_path = 'train_work/idxs_train.npy' # not much reason for this, but currently is a record of train set length
+idxs_queries_path = 'train_work/idxs_queries.npy'
+idxs_gt_path = 'train_work/idxs_gt.npy'
 index_path = 'abstracts-index/index.faiss'
 ivfdata_path = 'abstracts-index/index.ivfdata'
 
-os.makedirs('abstracts-embeddings/train', exist_ok=True)
+os.makedirs('train_work', exist_ok=True)
 os.makedirs('partial_indices', exist_ok=True)
 
 
