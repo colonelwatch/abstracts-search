@@ -7,7 +7,6 @@ import os
 import numpy as np
 import torch
 from tqdm import tqdm, trange
-from tqdm.contrib.concurrent import thread_map
 import faiss
 from faiss.contrib.ondisk import merge_ondisk
 import gc
@@ -50,72 +49,59 @@ np.random.seed(42)
 idxs_permuted = np.random.permutation(n_embeddings)
 
 
+idxs_train = idxs_permuted[:TRAIN_SIZE]
+idxs_train = np.sort(idxs_train)
+
 train_set_found = False
-if os.path.exists(works_train_path):
-    train_set_length = len(np.load(idxs_train_path))
-    if train_set_length == TRAIN_SIZE:
+if os.path.exists(idxs_train_path):
+    idxs_train = np.load(idxs_train_path)
+    train_set_length = len(idxs_train)
+    if train_set_length >= TRAIN_SIZE:
         train_set_found = True
 
 if train_set_found:
     print('Valid train set found, skipping train set generation...')
-
-    idxs_train = np.load(idxs_train_path) # expose idxs_train to the rest of the script
 else:
     print('Train set not found or invalid, generating train set...')
 
-    print('Loading embeddings...')
     embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
-    n_embeddings = len(embeddings)
-
-    print('Generating train set...')
-    idxs_train = idxs_permuted[:TRAIN_SIZE]
-    idxs_train = np.sort(idxs_train)
-    np.save(idxs_train_path, idxs_train)
-
     embeddings_train = np.memmap(works_train_path, dtype=np.float32, mode='w+', shape=(TRAIN_SIZE, D))
-    for i in trange(TRAIN_SIZE//CHUNK_SIZE+1):
-        idxs_train_chunk = idxs_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE]
-        embeddings_train[i*CHUNK_SIZE:(i+1)*CHUNK_SIZE] = embeddings[idxs_train_chunk]
+
+    # references to the embeddings array should destroyed immediately after use
+    for i in trange(0, TRAIN_SIZE, CHUNK_SIZE):
+        idxs_train_chunk = idxs_train[i:i+CHUNK_SIZE]
+        embeddings_train[i:i+CHUNK_SIZE] = embeddings[idxs_train_chunk]
         embeddings_train.flush()
+    
+    np.save(idxs_train_path, idxs_train) # should be saved AFTER generation to signify the generation was performed
 
     purge_from_memory(embeddings_train)
     purge_from_memory(embeddings)
 
 
-N_VECTORS_COMPARED = 65536
+idxs_queries = idxs_permuted[-TEST_SIZE:]
+idxs_queries = np.sort(idxs_queries)
 
-queries_set_found = False
-if os.path.exists(idxs_queries_path):
-    queries_set_length = len(np.load(idxs_queries_path))
-    if queries_set_length == TEST_SIZE:
-        queries_set_found = True
+gt_found = False
+if os.path.exists(idxs_gt_path):
+    idxs_gt = np.load(idxs_gt_path)
+    gt_set_length = len(idxs_gt)
+    if gt_set_length >= TEST_SIZE:
+        gt_found = True
 
-# The precomputed train set also needs to be valid. If it's not, the precomputed 
-# test and queries sets might be for the wrong slice of idxs_permuted
-if train_set_found and queries_set_found:
-    print('Queries test set found, skipping queries and ground truth sets generation...')
-
-    idxs_queries = np.load(idxs_queries_path) # expose idxs_queries to the rest of the script
-    idxs_gt = np.load(idxs_gt_path) # expose idxs_gt to the rest of the script
+if gt_found:
+    print('Valid ground truth set found, skipping ground truth generation...')
 else:
-    # the remaining cases is !T!Q, !TQ, and T!Q, but only !TQ needs a special explanation
-    if not train_set_found and queries_set_found:
-        print('Queries test set might be invalid, generating queries and ground truth sets...')
-    else:
-        print('Queries test set not found or invalid, generating queries and ground truth sets...')
+    print('Ground truth set not found or invalid, generating ground truth set...')
 
     embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
-    n_embeddings = len(embeddings)
-
-    idxs_queries = idxs_permuted[TRAIN_SIZE:TRAIN_SIZE+TEST_SIZE]
-    idxs_queries = np.sort(idxs_queries)
     embeddings_queries = embeddings[idxs_queries].copy()
     embeddings_queries = torch.from_numpy(embeddings_queries).cuda()
 
     scores_gt = np.zeros((TEST_SIZE, 10), dtype=np.float16)
     idxs_gt = np.empty((TEST_SIZE, 10), dtype=np.int64)
-    for i in trange(0, n_embeddings, N_VECTORS_COMPARED): 
-        idxs_chunk = np.arange(i, min(i+N_VECTORS_COMPARED, n_embeddings))
+    for i in trange(0, len(embeddings), 65536): # 65536 is the limit on the chunk size, determined by GPU VRAM
+        idxs_chunk = np.arange(i, min(i+65536, len(embeddings)))
         in_test_set = np.isin(idxs_chunk, idxs_queries)
         idxs_chunk = idxs_chunk[~in_test_set]
 
@@ -139,59 +125,55 @@ else:
     np.save(idxs_queries_path, idxs_queries)
     np.save(idxs_gt_path, idxs_gt)
 
+    purge_from_memory(embeddings_queries) # this purge is about leaked GPU VRAM, not the RAM a memmap would leak
     purge_from_memory(embeddings)
     torch.cuda.empty_cache()
 
 
 print('Training index...')
 
+index = faiss.index_factory(D, FACTORY_STRING, faiss.METRIC_INNER_PRODUCT)
+faiss.ParameterSpace().set_index_parameter(index, 'verbose', 1) # turn on verbose logging
+
 gpu_env = faiss.StandardGpuResources()
 gpu_options = faiss.GpuClonerOptions()
 gpu_options.useFloat16 = True
+index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
 
 embeddings_train = np.memmap(works_train_path, dtype=np.float32, mode='r', shape=(TRAIN_SIZE, D))
-
-index = faiss.index_factory(D, FACTORY_STRING, faiss.METRIC_INNER_PRODUCT)
-index = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
 index.train(embeddings_train)
-index = faiss.index_gpu_to_cpu(index)
-purge_from_memory(embeddings_train)
+faiss.ParameterSpace().set_index_parameter(index, 'verbose', 0) # turn off verbose logging
 
+index = faiss.index_gpu_to_cpu(index)
 faiss.write_index(index, 'partial_indices/empty.faiss')
 
+purge_from_memory(embeddings_train)
 
-print('Adding embeddings (except the test set) to trained index...')
+
+print('Addings embeddings (except the queries set) to trained index...')
 
 embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
-n_embeddings = len(embeddings)
-purge_from_memory(embeddings)
 
+n_chunks = 0
 temp_index_gpu = faiss.index_cpu_to_gpu(gpu_env, 0, index, gpu_options)
-for i in trange(len(embeddings)//CHUNK_SIZE+1):
-    offset = i*CHUNK_SIZE
-    shape = (min(CHUNK_SIZE, n_embeddings-offset), D)
-    n_bytes_per_elem = np.dtype(np.float16).itemsize
-    shard = np.memmap(works_path, dtype=np.float16, mode='r', offset=offset*D*n_bytes_per_elem, shape=shape)
-    shard = shard.astype(np.float32, copy=True)
+for i_chunk, i in enumerate(trange(0, len(embeddings), CHUNK_SIZE)):
+    idxs_chunk = np.arange(i, min(i+CHUNK_SIZE, len(embeddings)))
+    in_queries_set = np.isin(idxs_chunk, idxs_queries)
+    idxs_chunk = idxs_chunk[~in_queries_set]
 
-    faiss_ids = np.arange(offset, offset+shape[0])
-    in_test_set = np.isin(faiss_ids, idxs_queries)
-    faiss_ids = faiss_ids[~in_test_set]
-    shard = shard[~in_test_set]
-
-    temp_index_gpu.add_with_ids(shard, faiss_ids)
+    temp_index_gpu.add_with_ids(embeddings[idxs_chunk], idxs_chunk)
     temp_index = faiss.index_gpu_to_cpu(temp_index_gpu)
-    faiss.write_index(temp_index, f'partial_indices/index_{i:03d}.faiss')
-    
-    temp_index_gpu.reset()
-    purge_from_memory(shard)
+    faiss.write_index(temp_index, f'partial_indices/index_{i_chunk:03d}.faiss')
 
-partial_index_paths = [f'partial_indices/index_{i:03d}.faiss' for i in range(len(embeddings)//CHUNK_SIZE+1)]
+    n_chunks += 1
+    temp_index_gpu.reset()
 
 index = faiss.read_index('partial_indices/empty.faiss')
+partial_index_paths = [f'partial_indices/index_{i_chunk:03d}.faiss' for i_chunk in range(n_chunks)]
 merge_ondisk(index, partial_index_paths, ivfdata_path.replace('abstracts-index/', ''))
 faiss.write_index(index, index_path)
 
+purge_from_memory(embeddings)
 purge_from_memory(temp_index_gpu)
 purge_from_memory(temp_index)
 
@@ -199,15 +181,17 @@ purge_from_memory(temp_index)
 print('Evaluating index...')
 
 embeddings = np.memmap(works_path, dtype=np.float16, mode='r').reshape(-1, D)
-embeddings_test = embeddings[idxs_queries].astype(np.float32, copy=True)
+embeddings_queries = embeddings[idxs_queries].astype(np.float32, copy=True)
 purge_from_memory(embeddings) # after getting the test set, we don't need the whole embeddings array anymore
 
+idxs_gt = np.load(idxs_gt_path) # in case gt_set_length > TEST_SIZE, the last TEST_SIZE rows are the correct ones
+idxs_gt = idxs_gt[-TEST_SIZE:]
 tuning_criterion = faiss.IntersectionCriterion(TEST_SIZE, 10)
 tuning_criterion.set_groundtruth(None, idxs_gt)
 
 param_space = faiss.ParameterSpace()
 param_space.initialize(index)
-param_values = param_space.explore(index, embeddings_test, tuning_criterion)
+param_values = param_space.explore(index, embeddings_queries, tuning_criterion)
 
 param_values.display()
 
@@ -215,8 +199,9 @@ param_values.display()
 print('Adding test set to index...')
 
 partial_test_index = faiss.read_index('partial_indices/empty.faiss')
-partial_test_index.add_with_ids(embeddings_test, idxs_queries)
+partial_test_index.add_with_ids(embeddings_queries, idxs_queries)
 faiss.write_index(partial_test_index, 'partial_indices/index_test.faiss')
+
 partial_index_paths.append('partial_indices/index_test.faiss')
 
 index = faiss.read_index('partial_indices/empty.faiss')
@@ -230,6 +215,7 @@ with open('abstracts-embeddings/idxs.txt', 'r') as f, open('abstracts-index/idxs
     for line in f:
         lines_counter.update()
         g.write(line)
+
 
 print('Migrating ivfdata to abstracts-index...')
 os.rename(ivfdata_path.replace('abstracts-index/', ''), ivfdata_path)
