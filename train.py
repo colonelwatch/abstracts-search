@@ -209,9 +209,9 @@ merge_ondisk(index, partial_index_paths, ivfdata_path.replace('abstracts-index/'
 faiss.write_index(index, index_path)
 
 
-print('Copying idxs.txt to abstracts-index...')
+print('Copying openalex_ids.txt to abstracts-index...')
 lines_counter = tqdm(total=n_embeddings, desc='lines copied')
-with open('abstracts-embeddings/idxs.txt', 'r') as f, open('abstracts-index/idxs.txt', 'w') as g:
+with open('abstracts-embeddings/openalex_ids.txt', 'r') as f, open('abstracts-index/openalex_ids.txt', 'w') as g:
     for line in f:
         lines_counter.update()
         g.write(line)

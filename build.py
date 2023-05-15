@@ -156,7 +156,7 @@ if __name__ == '__main__':
     
     print('Merging partial works idxs lists...')
     idxs_chunks_paths = [f'partial_works/idxs_{i}.txt' for i in range(len(works_urls))]
-    with open('abstracts-embeddings/idxs.txt', 'w') as f:
+    with open('abstracts-embeddings/openalex_ids.txt', 'w') as f:
         for i, idxs_chunk_path in tqdm.tqdm(enumerate(idxs_chunks_paths), desc='idxs_chunks'):
             with open(idxs_chunk_path) as g:
                 idxs_chunk = g.read()
