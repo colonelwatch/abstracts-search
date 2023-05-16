@@ -6,11 +6,11 @@ The project is split into three repositories:
 
 * `abstracts-search`: Hosts `build.py` and `train.py`, the embedding and indexing scripts respectively
 * `abstracts-embeddings`: Hosts the raw embeddings (released under CC0) as a [Hugging Face Dataset](https://huggingface.co/datasets/colonelwatch/abstracts-embeddings)
-* `abstracts-index`: Hosts the index and `app.py`, the search interface, as a [Hugging Face Space](https://huggingface.co/spaces/colonelwatch/abstracts-index)
+* `abstracts-index`: Hosts the index and `app.py`, the search interface, as a [Hugging Face Space](https://huggingface.co/spaces/colonelwatch/abstracts-index) (also released under CC0)
 
 # Running Locally
 
-All data associated with the publications (titles, abstracts, authors, etc) is not provided by this project. Rather, it only contains in embeddings labeled with OpenAlex IDs, and the IDs are using to fetch that data from the OpenAlex API. An internet connection is therefore always needed. Still, running the semantic search locally may be desirable.
+All data associated with the publications (titles, abstracts, authors, etc) is not provided by this project. Rather, it only contains embeddings labeled with OpenAlex IDs, and the IDs are used to fetch that data from the OpenAlex API. An internet connection is therefore always needed. Still, running the semantic search locally may be desirable.
 
 If that is the case, the only repo that needs to be cloned is `abstracts-index`:
 
