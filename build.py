@@ -20,8 +20,6 @@ import requests
 import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-from multiprocessing import Process, Pool, Manager
-from itertools import repeat
 import tqdm
 
 CHUNK_SIZE = 1024 # number of works to process at a time
@@ -45,13 +43,9 @@ def _build_document(row):
     else:
         return _recover_abstract(row['abstract_inverted_index'])
 
-def works_url_routine(args):
-    os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
-
+def works_url_routine(i_task, works_url):
     # TODO: dynamically determine while GPU to use depending on concurrent processes
     model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
-
-    i_task, works_url = args
        
     idxs = []
     embeddings_chunks = []
@@ -119,10 +113,10 @@ if __name__ == '__main__':
 
 
     work_urls_counter = tqdm.tqdm(desc='work_urls', initial=i_next_task, total=len(works_urls), position=0)
-    with Manager() as manager, Pool(1) as pool, work_urls_counter:
+    with work_urls_counter:
         i_iter = range(i_next_task, len(works_urls))
-        args_iter = zip(i_iter, works_urls[i_next_task:])
-        for n_works in pool.imap(works_url_routine, args_iter):
+        for i_task, works_url in zip(i_iter, works_urls[i_next_task:]):
+            n_works = works_url_routine(i_task, works_url)
             i_last_completed_task += 1
             work_urls_counter.update(1)
             with open('partial_works/checkpoint.txt', 'w') as f:
