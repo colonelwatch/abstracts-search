@@ -24,8 +24,6 @@ from multiprocessing import Process, Pool, Manager
 from itertools import repeat
 import tqdm
 
-N_GPU_WORKERS = 1
-N_CPU_WORKERS = 6
 CHUNK_SIZE = 1024 # number of works to process at a time
 D = 384 # dimension of the embeddings
 
@@ -47,25 +45,18 @@ def _build_document(row):
     else:
         return _recover_abstract(row['abstract_inverted_index'])
 
-def model_routine(i_gpu, in_queue, out_queues): # a batch labelled with i_cpu is sent out on out_queues[i_cpu]
-    os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
-    
-    model = SentenceTransformer('all-MiniLM-L6-v2', device=f'cuda:{i_gpu}').half()
-    while True:
-        documents, i_cpu = in_queue.get()
-        embeddings = model.encode(documents, batch_size=128, show_progress_bar=False)
-        out_queues[i_cpu].put(embeddings)
-
 def works_url_routine(args):
     os.nice(10) # lower the priority of this process to avoid slowing down the rest of the system
-    
-    i_task, works_url, model_in_queue, model_out_queues = args
-    i_cpu = i_task%N_CPU_WORKERS # infer a unique CPU id from i_task (valid approach as long as we use the pool.imap)
+
+    # TODO: dynamically determine while GPU to use depending on concurrent processes
+    model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
+
+    i_task, works_url = args
        
     idxs = []
     embeddings_chunks = []
 
-    works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
+    works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=1, leave=False)
     chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
     with works_counter, chunks_reader:
         for works_chunk in chunks_reader:
@@ -84,8 +75,7 @@ def works_url_routine(args):
                 documents_chunk.append(_build_document(row))
             
             # build the idxs and embeddings for this chunk
-            model_in_queue.put((documents_chunk, i_cpu))
-            embeddings_chunk = model_out_queues[i_cpu].get()
+            embeddings_chunk = model.encode(documents_chunk, batch_size=128, show_progress_bar=False)
 
             embeddings_chunks.append(embeddings_chunk)
             works_counter.update(len(documents_chunk))
@@ -129,29 +119,14 @@ if __name__ == '__main__':
 
 
     work_urls_counter = tqdm.tqdm(desc='work_urls', initial=i_next_task, total=len(works_urls), position=0)
-    with Manager() as manager, Pool(N_CPU_WORKERS) as pool, work_urls_counter:
-        model_in_queue = manager.Queue()
-        model_out_queues = [manager.Queue() for _ in range(N_CPU_WORKERS)]
-        model_workers = [
-            Process(target=model_routine, args=(i_gpu, model_in_queue, model_out_queues))
-            for i_gpu in range(N_GPU_WORKERS)
-        ]
-        for i_gpu in range(N_GPU_WORKERS):
-            model_workers[i_gpu].start()
-
+    with Manager() as manager, Pool(1) as pool, work_urls_counter:
         i_iter = range(i_next_task, len(works_urls))
-        model_in_queue_iter = repeat(model_in_queue) # queues aren't pickleable, but they can be passed as an arg
-        model_out_queues_iter = repeat(model_out_queues)
-        args_iter = zip(i_iter, works_urls[i_next_task:], model_in_queue_iter, model_out_queues_iter)
+        args_iter = zip(i_iter, works_urls[i_next_task:])
         for n_works in pool.imap(works_url_routine, args_iter):
             i_last_completed_task += 1
             work_urls_counter.update(1)
             with open('partial_works/checkpoint.txt', 'w') as f:
                 f.write(works_urls[i_last_completed_task])
-        
-        for i_gpu in range(N_GPU_WORKERS):
-            model_workers[i_gpu].terminate()
-            model_workers[i_gpu].join()
 
     
     print('Merging partial works idxs lists...')
