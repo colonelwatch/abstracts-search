@@ -19,7 +19,6 @@ import shutil
 import requests
 import numpy as np
 import pandas as pd
-from fasttext.FastText import _FastText as FastText # importing this way to bypass a forced print to stderr
 from sentence_transformers import SentenceTransformer
 from multiprocessing import Process, Pool, Manager
 from itertools import repeat
@@ -63,45 +62,35 @@ def works_url_routine(args):
     i_task, works_url, model_in_queue, model_out_queues = args
     i_cpu = i_task%N_CPU_WORKERS # infer a unique CPU id from i_task (valid approach as long as we use the pool.imap)
        
-    idxs_chunks = []
+    idxs = []
     embeddings_chunks = []
 
-    lang_detector = FastText('lid.176.bin')
     works_counter = tqdm.tqdm(desc=f'works_{i_task}', position=i_cpu+1, leave=False)
     chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
     with works_counter, chunks_reader:
         for works_chunk in chunks_reader:
             # drop unnecessary columns and works with no abstract early to save time and memory
+            works_chunk = works_chunk[works_chunk['language'] == 'en']
             works_chunk = works_chunk[works_chunk['abstract_inverted_index'].notnull()]
             works_chunk = works_chunk[(works_chunk['abstract_inverted_index'].astype(str) != '{}')]
             works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']]
 
-            idxs_chunk = []
+            if len(works_chunk) == 0:
+                continue
+
             documents_chunk = []
             for _, row in works_chunk.iterrows():
-                idx = row['id']
-                document = _build_document(row)
-
-                cleaned_document = document.replace('\n', '').replace('\r', '') # FastText doesn't accept newlines
-                __label__lang = lang_detector.predict(cleaned_document)[0][0]
-
-                if __label__lang == '__label__en':
-                    idxs_chunk.append(idx)
-                    documents_chunk.append(document)
-            
-            if len(idxs_chunk) == 0:
-                continue
+                idxs.append(row['id'])
+                documents_chunk.append(_build_document(row))
             
             # build the idxs and embeddings for this chunk
             model_in_queue.put((documents_chunk, i_cpu))
             embeddings_chunk = model_out_queues[i_cpu].get()
 
-            idxs_chunks.append(idxs_chunk)
             embeddings_chunks.append(embeddings_chunk)
-            works_counter.update(len(idxs_chunk))
+            works_counter.update(len(documents_chunk))
     
     # merge all the idxs and embeddings chunks into a single list and array
-    idxs = sum(idxs_chunks, []) # flatten the list of lists
     embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)
 
     # save the idxs and embeddings built from this chunk to the disk
@@ -129,11 +118,6 @@ if __name__ == '__main__':
         last_downloaded_url = None
         shutil.rmtree('partial_works', ignore_errors=True)
         os.makedirs('partial_works')
-
-    # if lid.176.bin doesn't exist, download it
-    if not os.path.exists('lid.176.bin'):
-        print('Downloading FastText language detector...')
-        os.system('wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin')
 
 
     # Compare the checkpoint to the works manifest to determine which works to download
