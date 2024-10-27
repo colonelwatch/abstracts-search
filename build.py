@@ -21,9 +21,13 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 
 CHUNK_SIZE = 1024 # number of works to process at a time
 D = 384 # dimension of the embeddings
+SHARD_SIZE = 4194304  # (2^22), puts the shard size a bit under 4 GB
 
 def _recover_abstract(inverted_index):
     abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
@@ -74,14 +78,19 @@ def works_url_routine(i_task, works_url):
             embeddings_chunks.append(embeddings_chunk)
             works_counter.update(len(documents_chunk))
     
-    # merge all the idxs and embeddings chunks into a single list and array
+    # merge embeddings chunks into a single array
     embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)
 
-    # save the idxs and embeddings built from this chunk to the disk
-    np.save(f'partial_works/embeddings_{i_task}.npy', embeddings)
-    with open(f'partial_works/idxs_{i_task}.txt', 'w') as f:
-        f.write('\n'.join(idxs))
-    
+    idxs = pa.array(idxs, pa.string())
+    embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), D)
+    table = pa.Table.from_arrays([idxs, embeddings], names=['idxs', 'embeddings'])
+
+    pq.write_table(
+        table,
+        f'partial_works/embeddings_{i_task}.parquet',
+        compression='none',  # compressing float16 embeddings isn't worth it
+    )
+
     return len(idxs) # return the number of works processed
 
 if __name__ == '__main__':
@@ -122,34 +131,36 @@ if __name__ == '__main__':
             with open('partial_works/checkpoint.txt', 'w') as f:
                 f.write(works_urls[i_last_completed_task])
 
-    
-    print('Merging partial works idxs lists...')
-    idxs_chunks_paths = [f'partial_works/idxs_{i}.txt' for i in range(len(works_urls))]
-    with open('abstracts-embeddings/openalex_ids.txt', 'w') as f:
-        for i, idxs_chunk_path in tqdm.tqdm(enumerate(idxs_chunks_paths), desc='idxs_chunks'):
-            with open(idxs_chunk_path) as g:
-                idxs_chunk = g.read()
-            f.write(idxs_chunk)
-            if idxs_chunk and i != len(idxs_chunks_paths)-1:
-                f.write('\n')
+
+    def take_shard(idxs, embeddings, shard_id):
+        idxs_concat = pa.concat_arrays(idxs)
+        embeddings_concat = pa.concat_arrays(embeddings)
+
+        # TODO: make the shard schema a literal
+        shard = pa.table(
+            [idxs_concat[:SHARD_SIZE], embeddings_concat[:SHARD_SIZE]],
+            names=["idxs", "embeddings"]
+        )
+        pq.write_table(
+            shard,
+            f"abstracts-embeddings/embeddings_{shard_id:03}.parquet",
+            compression="none"
+        )
+
+        return [idxs_concat[SHARD_SIZE:]], [embeddings_concat[SHARD_SIZE:]]
 
 
     # merge the partial works tables
     print('Merging partial works tables...')
-    
-    n_rows = 0
-    embeddings_chunks_paths = [f'partial_works/embeddings_{i}.npy' for i in range(len(works_urls))]
-    for embeddings_chunk_path in embeddings_chunks_paths:
-        embeddings_chunk = np.load(embeddings_chunk_path)
-        n_rows += len(embeddings_chunk)
-
-    embeddings = np.memmap('abstracts-embeddings/embeddings.memmap', dtype=np.float16, mode='w+', shape=(n_rows, D))
-    
-    rows_ptr = 0
-    for embeddings_chunk_path in tqdm.tqdm(embeddings_chunks_paths, desc='embeddings_chunks'):
-        embeddings_chunk = np.load(embeddings_chunk_path)
-        embeddings[rows_ptr:rows_ptr+len(embeddings_chunk)] = embeddings_chunk
-        rows_ptr += len(embeddings_chunk)
-        embeddings.flush()
+    shard_id = 0
+    idxs = []
+    embeddings = []
+    for batch in ds.dataset("partial_works").to_batches():
+        idxs.append(batch['idxs'])
+        embeddings.append(batch['embeddings'])
+        while len(idxs) >= SHARD_SIZE:
+            idxs, embeddings = take_shard(idxs, embeddings, shard_id)
+            shard_id += 1
+    _, _ = take_shard(idxs, embeddings, shard_id)
 
     print('Done!')
