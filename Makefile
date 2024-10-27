@@ -1,8 +1,8 @@
 # Rules cannot have equal signs in the target, so this is a workaround
 EQ := =
 
-.PHONY: all
-all: abstracts-embeddings/data
+abstracts-embeddings/data: works
+	conda run -n abstracts-search python ./encode.py $< $@
 
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 									\
@@ -12,9 +12,6 @@ encode_rule := 									\
   s3://openalex/data/$$(subst .parquet,.gz,$$@) $$@
 
 include remote_targets.mk
-
-abstracts-embeddings/data: works
-	conda run -n abstracts-search python ./encode.py $< $@
 
 # mcli alias set publics3 https://s3.amazonaws.com "" ""
 # Creates individual rules for each remote updated=XXXX-XX-XX/part-XXX.gz file and a
