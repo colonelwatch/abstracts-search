@@ -14,48 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 import sys
 import numpy as np
-import pandas as pd
 from sentence_transformers import SentenceTransformer
-import tqdm
+from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 CHUNK_SIZE = 1024 # number of works to process at a time
 D = 384 # dimension of the embeddings
-SHARD_SIZE = 4194304  # (2^22), puts the shard size a bit under 4 GB
-
-def _recover_abstract(inverted_index):
-    abstract_size = max([max(appearances) for appearances in inverted_index.values()])+1
-
-    abstract = [None]*abstract_size
-    for word, appearances in inverted_index.items(): # yes, this is a second iteration over inverted_index
-        for appearance in appearances:
-            abstract[appearance] = word
-
-    abstract = [word for word in abstract if word is not None]
-    abstract = ' '.join(abstract)
-    return abstract
-
-def _build_document(row):
-    if row['title']:
-        return f'{row["title"]} {_recover_abstract(row["abstract_inverted_index"])}'
-    else:
-        return _recover_abstract(row['abstract_inverted_index'])
 
 # TODO: dynamically determine while GPU to use depending on concurrent processes
 model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
 
 try:
-    works_url = sys.argv[1]
-except IndexError:
-    print("works_url not given")
-    exit(0)
-
-try:
-    parquet_path = sys.argv[2]
+    parquet_path = sys.argv[1]
 except IndexError:
     print("parquet_path not given")
     exit(0)
@@ -63,29 +38,21 @@ except IndexError:
 idxs = []
 embeddings_chunks = []
 
-works_counter = tqdm.tqdm(desc=works_url)  # TODO: same issue for tqdm
-chunks_reader = pd.read_json(works_url, lines=True, chunksize=CHUNK_SIZE)
-with works_counter, chunks_reader:
-    for works_chunk in chunks_reader:
-        # drop unnecessary columns and works with no abstract early to save time and memory
-        works_chunk = works_chunk[works_chunk['language'] == 'en']
-        works_chunk = works_chunk[works_chunk['abstract_inverted_index'].notnull()]
-        works_chunk = works_chunk[(works_chunk['abstract_inverted_index'].astype(str) != '{}')]
-        works_chunk = works_chunk[['id', 'title', 'abstract_inverted_index']]
+documents_chunk = []
+for line in tqdm(sys.stdin, desc="works", leave=False):
+    row = json.loads(line)
+    idxs.append(row["id"])
+    documents_chunk.append(row["document"])
 
-        if len(works_chunk) == 0:
-            continue
-
-        documents_chunk = []
-        for _, row in works_chunk.iterrows():
-            idxs.append(row['id'])
-            documents_chunk.append(_build_document(row))
-        
-        # build the idxs and embeddings for this chunk
-        embeddings_chunk = model.encode(documents_chunk, batch_size=128, show_progress_bar=False)
-
+    if len(documents_chunk) >= CHUNK_SIZE:
+        embeddings_chunk = model.encode(documents_chunk, batch_size=CHUNK_SIZE)
         embeddings_chunks.append(embeddings_chunk)
-        works_counter.update(len(documents_chunk))
+        documents_chunk = []
+
+if documents_chunk:
+    embeddings_chunk = model.encode(documents_chunk, batch_size=CHUNK_SIZE)
+    embeddings_chunks.append(embeddings_chunk)
+    documents_chunk = []
 
 # merge embeddings chunks into a single array
 embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)

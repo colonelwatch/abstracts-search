@@ -20,8 +20,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 
-CHUNK_SIZE = 1024 # number of works to process at a time
-D = 384 # dimension of the embeddings
 SHARD_SIZE = 4194304  # (2^22), puts the shard size a bit under 4 GB
 
 
