@@ -1,21 +1,28 @@
+MODEL := all-MiniLM-L6-v2
 CFLAGS := -O2
 
 # Rules cannot have equal signs in the target, so this is a workaround
 EQ := =
 
 abstracts-embeddings/data: works
-	conda run -n abstracts-search python ./encode.py $< $@
+	conda run -n abstracts-search --live-stream python ./encode.py $< $@
 
 oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+.PHONY: model
+model:
+	conda run -n abstracts-search --live-stream python -c 		\
+	"from sentence_transformers import SentenceTransformer; 	\
+	SentenceTransformer(\"$(MODEL)\")"
+
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 								\
-  <TGT> : oa_jsonl ; 							\
+  <TGT> : oa_jsonl model; 						\
   mcli cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 		\
   pigz -d | ./oa_jsonl | 						\
   conda run -n abstracts-search --live-stream python ./build.py $$@ 	\
-  "all-MiniLM-L6-v2"
+  $(MODEL)
 
 include remote_targets.mk
 
