@@ -14,7 +14,8 @@ encode_rule := 								\
   <TGT> : oa_jsonl ; 							\
   mcli cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 		\
   pigz -d | ./oa_jsonl | 						\
-  conda run -n abstracts-search --live-stream python ./build.py $$@
+  conda run -n abstracts-search --live-stream python ./build.py $$@ 	\
+  "all-MiniLM-L6-v2"
 
 include remote_targets.mk
 

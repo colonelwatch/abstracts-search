@@ -27,19 +27,35 @@ from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
 
+TRUST_REMOTE_CODE = False
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
 D = 384  # dimension of the embeddings
 
 
-# TODO: for now, assuming no prompts
-def encode_faster(model: SentenceTransformer, sentences: list[str]):
+def encode_faster(model: SentenceTransformer, sentences: list[str], prompt: str | None):
     model.eval()
-    features = model.tokenize(sentences)
-    features = {k: v.to(model.device, non_blocking=True) for k, v in features.items()}
+
+    if prompt is None:
+        features = {}
+    else:
+        sentences = [prompt + sentence for sentence in sentences]
+
+        tokenized_prompt = model.tokenize([prompt])
+        if "input_ids" in tokenized_prompt:
+            features = {"input_ids": tokenized_prompt["input_ids"].shape[-1] - 1}
+        else:
+            features = {}
+
+    features |= {
+        k: v.to(model.device, non_blocking=True)
+        for k, v in model.tokenize(sentences).items()
+    }    
+
     with torch.no_grad():
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
+
     return embeddings.float().cpu().numpy()
 
 
@@ -49,13 +65,23 @@ except IndexError:
     print("parquet_path not given")
     exit(0)
 
-# TODO: dynamically determine while GPU to use depending on concurrent processes
-model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda:0").bfloat16()
+try:
+    model_name = sys.argv[2]
+except IndexError:
+    print("model_name not given")
+    exit(0)
 
-if model.default_prompt_name is not None:
-    prompt = model.prompts.get(model.default_prompt_name, None)
-    if prompt is not None:
-        raise NotImplementedError("No fast encoding with a model that uses prompts")
+try:
+    prompt_name = sys.argv[3]
+except IndexError:
+    prompt_name = None
+
+# TODO: dynamically determine while GPU to use depending on concurrent processes
+model = SentenceTransformer(
+    model_name, device="cuda:0", trust_remote_code=TRUST_REMOTE_CODE
+)
+model = model.bfloat16()
+prompt = model.prompts[prompt_name] if prompt_name is not None else None
 
 idxs = []
 embeddings_chunks = []
@@ -77,7 +103,9 @@ with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executo
                 counter.update(len(embeddings_chunk))
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
-            task_queue.append(executor.submit(encode_faster, model, documents_chunk))
+            task_queue.append(
+                executor.submit(encode_faster, model, documents_chunk, prompt)
+            )
             documents_chunk = []
 
     # wait for the remaining tasks to finish
@@ -88,7 +116,7 @@ with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executo
 
     # encode the remaining documents
     if documents_chunk:
-        embeddings_chunk = encode_faster(model, documents_chunk)
+        embeddings_chunk = encode_faster(model, documents_chunk, prompt)
         embeddings_chunks.append(embeddings_chunk)
         counter.update(len(embeddings_chunk))
 
