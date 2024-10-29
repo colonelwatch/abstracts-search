@@ -87,7 +87,10 @@ idxs = []
 embeddings_chunks = []
 task_queue = deque[Future]()
 
-with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executor:
+with (
+    tqdm(desc="works", leave=False) as counter,
+    ThreadPoolExecutor(N_TASKS) as executor
+):
     documents_chunk = []
     for line in sys.stdin:
         row = json.loads(line)
