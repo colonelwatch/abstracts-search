@@ -40,7 +40,7 @@ def encode_faster(model: SentenceTransformer, sentences: list[str]):
     with torch.no_grad():
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
-    return embeddings.cpu().numpy()
+    return embeddings.float().cpu().numpy()
 
 
 try:
@@ -50,7 +50,7 @@ except IndexError:
     exit(0)
 
 # TODO: dynamically determine while GPU to use depending on concurrent processes
-model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda:0").half()
+model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda:0").bfloat16()
 
 if model.default_prompt_name is not None:
     prompt = model.prompts.get(model.default_prompt_name, None)
@@ -96,7 +96,7 @@ with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executo
 if embeddings_chunks:
     embeddings = np.vstack(embeddings_chunks)
 else:
-    embeddings = np.empty((0, D), dtype=np.float16)
+    embeddings = np.empty((0, D), dtype=np.float32)
 
 idxs = pa.array(idxs, pa.string())
 embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), D)
@@ -104,4 +104,6 @@ table = pa.Table.from_arrays([idxs, embeddings], names=["idxs", "embeddings"])
 
 # compressing float16 embeddings isn't worth it
 Path(parquet_path).parent.mkdir(parents=True, exist_ok=True)
-pq.write_table(table, parquet_path, compression='none')
+pq.write_table(
+    table, parquet_path, compression="lz4", use_byte_stream_split=["embeddings"]
+)
