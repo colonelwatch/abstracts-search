@@ -14,21 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future
 import json
 from pathlib import Path
 import sys
+
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sentence_transformers import SentenceTransformer
 import torch
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, Future
+from tqdm import tqdm
 
 N_TASKS = 2
-CHUNK_SIZE = 256 # number of works to process at a time
-D = 384 # dimension of the embeddings
+CHUNK_SIZE = 256  # number of works to process at a time
+D = 384  # dimension of the embeddings
 
 
 # TODO: for now, assuming no prompts
@@ -49,7 +50,7 @@ except IndexError:
     exit(0)
 
 # TODO: dynamically determine while GPU to use depending on concurrent processes
-model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
+model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda:0").half()
 
 if model.default_prompt_name is not None:
     prompt = model.prompts.get(model.default_prompt_name, None)
@@ -92,12 +93,15 @@ with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executo
         counter.update(len(embeddings_chunk))
 
 # merge embeddings chunks into a single array
-embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)
+if embeddings_chunks:
+    embeddings = np.vstack(embeddings_chunks)
+else:
+    embeddings = np.empty((0, D), dtype=np.float16)
 
 idxs = pa.array(idxs, pa.string())
 embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), D)
-table = pa.Table.from_arrays([idxs, embeddings], names=['idxs', 'embeddings'])
+table = pa.Table.from_arrays([idxs, embeddings], names=["idxs", "embeddings"])
 
 # compressing float16 embeddings isn't worth it
 Path(parquet_path).parent.mkdir(parents=True, exist_ok=True)
-pq.write_table(table,  parquet_path, compression='none')
+pq.write_table(table, parquet_path, compression='none')
