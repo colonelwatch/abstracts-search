@@ -22,12 +22,25 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future
 
-CHUNK_SIZE = 1024 # number of works to process at a time
+N_TASKS = 2
+CHUNK_SIZE = 256 # number of works to process at a time
 D = 384 # dimension of the embeddings
 
-# TODO: dynamically determine while GPU to use depending on concurrent processes
-model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
+
+# TODO: for now, assuming no prompts
+def encode_faster(model: SentenceTransformer, sentences: list[str]):
+    model.eval()
+    features = model.tokenize(sentences)
+    features = {k: v.to(model.device, non_blocking=True) for k, v in features.items()}
+    with torch.no_grad():
+        out_features = model.forward(features)
+        embeddings = out_features["sentence_embedding"]
+    return embeddings.cpu().numpy()
+
 
 try:
     parquet_path = sys.argv[1]
@@ -35,24 +48,48 @@ except IndexError:
     print("parquet_path not given")
     exit(0)
 
+# TODO: dynamically determine while GPU to use depending on concurrent processes
+model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda:0').half()
+
+if model.default_prompt_name is not None:
+    prompt = model.prompts.get(model.default_prompt_name, None)
+    if prompt is not None:
+        raise NotImplementedError("No fast encoding with a model that uses prompts")
+
 idxs = []
 embeddings_chunks = []
+task_queue = deque[Future]()
 
-documents_chunk = []
-for line in tqdm(sys.stdin, desc="works", leave=False):
-    row = json.loads(line)
-    idxs.append(row["id"])
-    documents_chunk.append(row["document"])
-
-    if len(documents_chunk) >= CHUNK_SIZE:
-        embeddings_chunk = model.encode(documents_chunk, batch_size=CHUNK_SIZE)
-        embeddings_chunks.append(embeddings_chunk)
-        documents_chunk = []
-
-if documents_chunk:
-    embeddings_chunk = model.encode(documents_chunk, batch_size=CHUNK_SIZE)
-    embeddings_chunks.append(embeddings_chunk)
+with tqdm(desc="works", leave=False) as counter, ThreadPoolExecutor() as executor:
     documents_chunk = []
+    for line in sys.stdin:
+        row = json.loads(line)
+        idxs.append(row["id"])
+        documents_chunk.append(row["document"])
+
+        # for efficiency, encode multiple chunks in parallel
+        if len(documents_chunk) >= CHUNK_SIZE:
+            # clear out the task queue of completed tasks, then wait until there's room
+            while (task_queue and task_queue[0].done()) or len(task_queue) > N_TASKS:
+                embeddings_chunk = task_queue.popleft().result()
+                embeddings_chunks.append(embeddings_chunk)
+                counter.update(len(embeddings_chunk))
+
+            # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
+            task_queue.append(executor.submit(encode_faster, model, documents_chunk))
+            documents_chunk = []
+
+    # wait for the remaining tasks to finish
+    while task_queue:
+        embeddings_chunk = task_queue.popleft().result()
+        embeddings_chunks.append(embeddings_chunk)
+        counter.update(len(embeddings_chunk))
+
+    # encode the remaining documents
+    if documents_chunk:
+        embeddings_chunk = encode_faster(model, documents_chunk)
+        embeddings_chunks.append(embeddings_chunk)
+        counter.update(len(embeddings_chunk))
 
 # merge embeddings chunks into a single array
 embeddings = np.vstack(embeddings_chunks) if embeddings_chunks else np.empty((0, D), dtype=np.float16)
