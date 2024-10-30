@@ -105,9 +105,10 @@ with FileLock("/tmp/abstracts-search-gpu.lock", timeout=LOCK_TIMEOUT):
             if "python" in proc_name:
                 proc_count[bus_id_to_index[gpu_bus_id]] += 1
 
+    selected_index = min(range(len(proc_count)), key=(lambda i: proc_count[i]))
     model = SentenceTransformer(
         model_name,
-        device=f"cuda:{np.argmin(proc_count)}",
+        device=f"cuda:{selected_index}",
         trust_remote_code=TRUST_REMOTE_CODE
     )
 
