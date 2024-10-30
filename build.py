@@ -19,7 +19,9 @@ from concurrent.futures import ThreadPoolExecutor, Future
 import json
 from pathlib import Path
 import sys
+from subprocess import Popen, PIPE
 
+from filelock import FileLock
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -32,6 +34,7 @@ FP16 = True
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
 D = 384  # dimension of the embeddings
+LOCK_TIMEOUT = 10
 
 
 def encode_faster(model: SentenceTransformer, sentences: list[str], prompt: str | None):
@@ -81,10 +84,33 @@ try:
 except IndexError:
     prompt_name = None
 
-# TODO: dynamically determine while GPU to use depending on concurrent processes
-model = SentenceTransformer(
-    model_name, device="cuda:0", trust_remote_code=TRUST_REMOTE_CODE
-)
+# Find the first GPU that isn't occupied by python then occupy it with the model
+with FileLock("/tmp/abstracts-search-gpu.lock", timeout=LOCK_TIMEOUT):
+    bus_id_to_index: dict[str, str] = {}
+    with Popen(
+        ["nvidia-smi", "--query-gpu=gpu_bus_id,index", "--format=csv,noheader"],
+        stdout=PIPE
+    ) as p:
+        for line in p.stdout:
+            gpu_bus_id, index = [v.strip() for v in line.decode().split(",")]
+            bus_id_to_index[gpu_bus_id] = int(index)
+
+    proc_count = [0] * len(bus_id_to_index)
+    with Popen(
+        ["nvidia-smi", "--query-compute-apps=gpu_bus_id,name", "--format=csv,noheader"],
+        stdout=PIPE
+    ) as p:
+        for line in p.stdout:
+            gpu_bus_id, proc_name = [v.strip() for v in line.decode().split(",")]
+            if "python" in proc_name:
+                proc_count[bus_id_to_index[gpu_bus_id]] += 1
+
+    model = SentenceTransformer(
+        model_name,
+        device=f"cuda:{np.argmin(proc_count)}",
+        trust_remote_code=TRUST_REMOTE_CODE
+    )
+
 model = model.bfloat16() if not FP16 else model.half()
 prompt = model.prompts[prompt_name] if prompt_name is not None else None
 
