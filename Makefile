@@ -1,3 +1,4 @@
+SHELL := bash  # TODO: lift this requirement?
 MODEL := all-MiniLM-L6-v2
 CFLAGS := -O2
 
