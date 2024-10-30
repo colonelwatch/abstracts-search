@@ -28,6 +28,7 @@ import torch
 from tqdm import tqdm
 
 TRUST_REMOTE_CODE = False
+FP16 = True
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
 D = 384  # dimension of the embeddings
@@ -56,7 +57,11 @@ def encode_faster(model: SentenceTransformer, sentences: list[str], prompt: str 
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
 
-    return embeddings.float().cpu().numpy()
+    if not FP16:
+        # convert to float32 numpy to preserve all bits
+        return embeddings.float().cpu().numpy()
+    else:
+        return embeddings.cpu().numpy()
 
 
 try:
@@ -80,7 +85,7 @@ except IndexError:
 model = SentenceTransformer(
     model_name, device="cuda:0", trust_remote_code=TRUST_REMOTE_CODE
 )
-model = model.bfloat16()
+model = model.bfloat16() if not FP16 else model.half()
 prompt = model.prompts[prompt_name] if prompt_name is not None else None
 
 idxs = []
@@ -127,14 +132,19 @@ with (
 if embeddings_chunks:
     embeddings = np.vstack(embeddings_chunks)
 else:
-    embeddings = np.empty((0, D), dtype=np.float32)
+    embeddings = np.empty((0, D), dtype=np.float32 if not FP16 else np.float16)
 
 idxs = pa.array(idxs, pa.string())
 embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), D)
 table = pa.Table.from_arrays([idxs, embeddings], names=["idxs", "embeddings"])
 
-# compressing float16 embeddings isn't worth it
 Path(parquet_path).parent.mkdir(parents=True, exist_ok=True)
-pq.write_table(
-    table, parquet_path, compression="lz4", use_byte_stream_split=["embeddings"]
-)
+if not FP16:
+    # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
+    # completely zero. Exploit this with byte-stream split and lz4 compression
+    pq.write_table(
+        table, parquet_path, compression="lz4", use_byte_stream_split=["embeddings"]
+    )
+else:
+    # compressing float16 embeddings isn't worth it
+    pq.write_table(table, parquet_path, compression="none")
