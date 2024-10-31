@@ -38,7 +38,7 @@ remote_targets.mk: Makefile  # emits works as a target
 	rule=$$(mktemp); 							\
 	printf "works: " >> $$rule; 						\
 	for p in $$(								\
-		mcli ls --recursive publics3/openalex/data/works | 		\
+		$(MC) ls --recursive publics3/openalex/data/works | 		\
 		sed -e 's/.* \(.*\)/\1/'					\
 	); do 									\
 		if [[ $$p == "manifest" ]]; then 				\
