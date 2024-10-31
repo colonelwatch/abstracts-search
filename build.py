@@ -27,7 +27,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer
 import torch
-from tqdm import tqdm
 
 TRUST_REMOTE_CODE = False
 FP16 = True
@@ -119,10 +118,7 @@ idxs = []
 embeddings_chunks = []
 task_queue = deque[Future]()
 
-with (
-    tqdm(desc="works", leave=False) as counter,
-    ThreadPoolExecutor(N_TASKS) as executor
-):
+with ThreadPoolExecutor(N_TASKS) as executor:
     documents_chunk = []
     for line in sys.stdin:
         row = json.loads(line)
@@ -135,7 +131,6 @@ with (
             while (task_queue and task_queue[0].done()) or len(task_queue) > N_TASKS:
                 embeddings_chunk = task_queue.popleft().result()
                 embeddings_chunks.append(embeddings_chunk)
-                counter.update(len(embeddings_chunk))
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             task_queue.append(
@@ -147,13 +142,11 @@ with (
     while task_queue:
         embeddings_chunk = task_queue.popleft().result()
         embeddings_chunks.append(embeddings_chunk)
-        counter.update(len(embeddings_chunk))
 
     # encode the remaining documents
     if documents_chunk:
         embeddings_chunk = encode_faster(model, documents_chunk, prompt)
         embeddings_chunks.append(embeddings_chunk)
-        counter.update(len(embeddings_chunk))
 
 # merge embeddings chunks into a single array
 if embeddings_chunks:
