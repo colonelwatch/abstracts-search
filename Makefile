@@ -1,4 +1,6 @@
 SHELL := bash  # TODO: lift this requirement?
+MC := mc  # TODO: make aws cli an option?
+GZIP := pigz
 MODEL := all-MiniLM-L6-v2
 CFLAGS := -O2
 
@@ -20,8 +22,8 @@ model:
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 								\
   <TGT> : oa_jsonl model; 						\
-  mcli cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 		\
-  pigz -d | ./oa_jsonl | 						\
+  $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
+  $(GZIP) -d | ./oa_jsonl | 						\
   conda run -n abstracts-search --live-stream python ./build.py $$@ 	\
   $(MODEL)
 
