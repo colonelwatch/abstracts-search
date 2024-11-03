@@ -13,15 +13,9 @@ abstracts-embeddings/data: works
 oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: model
-model:
-	conda run -n abstracts-search --live-stream python -c 		\
-	"from sentence_transformers import SentenceTransformer; 	\
-	SentenceTransformer(\"$(MODEL)\")"
-
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 								\
-  <TGT> : oa_jsonl model; 						\
+  <TGT> : oa_jsonl; 						\
   $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
   $(GZIP) -d | ./oa_jsonl | 						\
   conda run -n abstracts-search --live-stream python ./build.py $$@ 	\
