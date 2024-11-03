@@ -98,16 +98,13 @@ def encode_faster(
 ):
     model.eval()
 
-    if prompt is None:
-        features = {}
-    else:
+    features = {}
+    if prompt is not None:
         sentences = [prompt + sentence for sentence in sentences]
 
         tokenized_prompt = model.tokenize([prompt])
         if "input_ids" in tokenized_prompt:
-            features = {"input_ids": tokenized_prompt["input_ids"].shape[-1] - 1}
-        else:
-            features = {}
+            features |= {"input_ids": tokenized_prompt["input_ids"].shape[-1] - 1}
 
     features |= {
         k: v.to(model.device, non_blocking=True)
