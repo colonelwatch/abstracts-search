@@ -210,7 +210,7 @@ def main():
         print("model doesn't have exact embedding dim")
         exit(-1)
 
-    chunks = load_oajsonl_chunked(sys.stdin, args.chunk_size)
+    chunks = load_oajsonl_chunked(sys.stdin.buffer, args.chunk_size)
     chunks = encode_pipelined(chunks, model, prompt, args.bf16, args.tasks)
 
     idxs_chunks: list[list[str]] = []
