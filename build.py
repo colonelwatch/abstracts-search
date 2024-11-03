@@ -59,9 +59,11 @@ def get_model(
         ["nvidia-smi", "--query-compute-apps=gpu_bus_id,name", "--format=csv,noheader"],
         stdout=PIPE
     )
+    assert p1.stdout is not None
+    assert p2.stdout is not None
 
     # get "cuda:X" device indices for each GPU
-    bus_id_to_index: dict[str, str] = {}
+    bus_id_to_index: dict[str, int] = {}
     with p1:
         for line in p1.stdout:
             gpu_bus_id, index = [v.strip() for v in line.decode().split(",")]
