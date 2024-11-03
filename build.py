@@ -91,7 +91,7 @@ def get_model(
 
 def load_oajsonl_chunked(
     f: TextIO | BinaryIO, chunk_size: int
-) -> Generator[tuple[list[str], list[str]]]:
+) -> Generator[tuple[list[str], list[str]], None, None]:
     idxs_chunk: list[str] = []
     documents_chunk: list[str] = []
     for line in f:
@@ -151,7 +151,7 @@ def encode_pipelined(
     bf16: bool,
     n_tasks: int,
     progress: bool,
-) -> Generator[tuple[list[str], npt.NDArray]]:
+) -> Generator[tuple[list[str], npt.NDArray], None, None]:
     idxs_chunks = deque[list[str]]()
     embed_tasks = deque[Future[npt.NDArray]]()
     with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
