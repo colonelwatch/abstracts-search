@@ -32,7 +32,6 @@ TRUST_REMOTE_CODE = False
 FP16 = True
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
-D = 384  # dimension of the embeddings
 
 
 def encode_faster(model: SentenceTransformer, sentences: list[str], prompt: str | None):
@@ -69,13 +68,13 @@ try:
     parquet_path = sys.argv[1]
 except IndexError:
     print("parquet_path not given")
-    exit(0)
+    exit(-1)
 
 try:
     model_name = sys.argv[2]
 except IndexError:
     print("model_name not given")
-    exit(0)
+    exit(-1)
 
 try:
     prompt_name = sys.argv[3]
@@ -112,6 +111,11 @@ with FileLock("/tmp/abstracts-search-gpu.lock"):
         device=f"cuda:{selected_index}",
         trust_remote_code=TRUST_REMOTE_CODE
     )
+
+embedding_dim = model.get_sentence_embedding_dimension()
+if embedding_dim is None:
+    print("model doesn't have exact embedding dim")
+    exit(-1)
 
 model = model.bfloat16() if not FP16 else model.half()
 prompt = model.prompts[prompt_name] if prompt_name is not None else None
@@ -154,10 +158,13 @@ with ThreadPoolExecutor(N_TASKS) as executor:
 if embeddings_chunks:
     embeddings = np.vstack(embeddings_chunks)
 else:
-    embeddings = np.empty((0, D), dtype=np.float32 if not FP16 else np.float16)
+    embeddings = np.empty(
+        (0, embedding_dim),
+        dtype=np.float32 if not FP16 else np.float16
+    )
 
 idxs = pa.array(idxs, pa.string())
-embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), D)
+embeddings = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), embedding_dim)
 table = pa.Table.from_arrays([idxs, embeddings], names=["idxs", "embeddings"])
 
 Path(parquet_path).parent.mkdir(parents=True, exist_ok=True)
