@@ -33,7 +33,6 @@ FP16 = True
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
 D = 384  # dimension of the embeddings
-LOCK_TIMEOUT = 10
 
 
 def encode_faster(model: SentenceTransformer, sentences: list[str], prompt: str | None):
@@ -84,22 +83,25 @@ except IndexError:
     prompt_name = None
 
 # Find the first GPU that isn't occupied by python then occupy it with the model
-with FileLock("/tmp/abstracts-search-gpu.lock", timeout=LOCK_TIMEOUT):
-    bus_id_to_index: dict[str, str] = {}
-    with Popen(
+with FileLock("/tmp/abstracts-search-gpu.lock"):
+    p1 = Popen(
         ["nvidia-smi", "--query-gpu=gpu_bus_id,index", "--format=csv,noheader"],
         stdout=PIPE
-    ) as p:
-        for line in p.stdout:
+    )
+    p2 = Popen(
+        ["nvidia-smi", "--query-compute-apps=gpu_bus_id,name", "--format=csv,noheader"],
+        stdout=PIPE
+    )
+
+    bus_id_to_index: dict[str, str] = {}
+    with p1:
+        for line in p1.stdout:
             gpu_bus_id, index = [v.strip() for v in line.decode().split(",")]
             bus_id_to_index[gpu_bus_id] = int(index)
 
     proc_count = [0] * len(bus_id_to_index)
-    with Popen(
-        ["nvidia-smi", "--query-compute-apps=gpu_bus_id,name", "--format=csv,noheader"],
-        stdout=PIPE
-    ) as p:
-        for line in p.stdout:
+    with p2:
+        for line in p2.stdout:
             gpu_bus_id, proc_name = [v.strip() for v in line.decode().split(",")]
             if "python" in proc_name:
                 proc_count[bus_id_to_index[gpu_bus_id]] += 1
