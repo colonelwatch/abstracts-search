@@ -15,7 +15,7 @@ oa_jsonl: oa_jsonl.c
 
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 								\
-  <TGT> : oa_jsonl; 						\
+  <TGT> : oa_jsonl; 							\
   $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
   $(GZIP) -d | ./oa_jsonl | 						\
   conda run -n abstracts-search --live-stream python ./build.py 	\
