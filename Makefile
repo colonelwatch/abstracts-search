@@ -56,5 +56,5 @@ remote_targets.mk: Makefile  # emits works as a target
 clean:
 	rm -rf works
 	rm -rf abstracts-embeddings/data
-	rm remote_targets.mk
-	rm oa_jsonl
+	rm -f remote_targets.mk
+	rm -f oa_jsonl
