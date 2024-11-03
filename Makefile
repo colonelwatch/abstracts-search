@@ -18,8 +18,8 @@ encode_rule := 								\
   <TGT> : oa_jsonl; 						\
   $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
   $(GZIP) -d | ./oa_jsonl | 						\
-  conda run -n abstracts-search --live-stream python ./build.py $$@ 	\
-  $(MODEL)
+  conda run -n abstracts-search --live-stream python ./build.py 	\
+  --model-name $(MODEL) $$@
 
 include remote_targets.mk
 

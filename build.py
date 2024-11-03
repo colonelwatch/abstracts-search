@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from argparse import ArgumentParser
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 import json
@@ -31,9 +32,18 @@ from sentence_transformers import SentenceTransformer
 import torch
 
 TRUST_REMOTE_CODE = False
-FP16 = True
 N_TASKS = 2
 CHUNK_SIZE = 256  # number of works to process at a time
+
+
+def parse_args():
+    parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
+    parser.add_argument("parquet_path")
+    parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
+    parser.add_argument("-p", "--prompt-name", default=None)
+    parser.add_argument("--fp16", action="store_false", dest="bf16")
+    args = parser.parse_args()
+    return args
 
 
 def get_model(model_name: str, bf16: bool):
@@ -94,7 +104,8 @@ def load_oajsonl_chunked(f: TextIO | BinaryIO, chunk_size: int):
 def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
-    prompt: str | None
+    prompt: str | None,
+    bf16: bool
 ):
     model.eval()
 
@@ -115,7 +126,7 @@ def encode_faster(
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
 
-    if not FP16:
+    if bf16:
         # convert to float32 numpy to preserve all bits
         return embeddings.float().cpu().numpy()
     else:
@@ -126,6 +137,7 @@ def encode_pipelined(
     chunks: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
     prompt: str,
+    bf16: bool,
     n_tasks: int
 ):
     idxs_chunks = deque[list[str]]()
@@ -139,7 +151,7 @@ def encode_pipelined(
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_chunks.append(idxs_chunk)
             embed_tasks.append(
-                executor.submit(encode_faster, model, documents_chunk, prompt)
+                executor.submit(encode_faster, model, documents_chunk, prompt, bf16)
             )
 
         # wait for the remaining tasks to finish
@@ -183,35 +195,24 @@ def write_parquet(
 
 
 def main():
-    try:
-        parquet_path = sys.argv[1]
-    except IndexError:
-        print("parquet_path not given")
-        exit(-1)
-
-    try:
-        model_name = sys.argv[2]
-    except IndexError:
-        print("model_name not given")
-        exit(-1)
-
-    try:
-        prompt_name = sys.argv[3]
-    except IndexError:
-        prompt_name = None
+    args = parse_args()
 
     # Get model with file lock to ensure next process will see this one
     with FileLock("/tmp/abstracts-search-gpu.lock"):
-        model = get_model(model_name, not FP16)
+        model = get_model(args.model_name, args.bf16)
+
+    if args.prompt_name is None:
+        prompt = None
+    else:
+        prompt = model.prompts[args.prompt_name]
 
     embedding_dim = model.get_sentence_embedding_dimension()
     if embedding_dim is None:
         print("model doesn't have exact embedding dim")
         exit(-1)
 
-    prompt = model.prompts[prompt_name] if prompt_name is not None else None
     chunks = load_oajsonl_chunked(sys.stdin, CHUNK_SIZE)
-    chunks = encode_pipelined(chunks, model, prompt, N_TASKS)
+    chunks = encode_pipelined(chunks, model, prompt, args.bf16, N_TASKS)
 
     idxs_chunks: list[list[str]] = []
     embeddings_chunks: list[npt.NDArray] = []
@@ -226,10 +227,10 @@ def main():
     else:
         embeddings = np.empty(
             (0, embedding_dim),
-            dtype=np.float32 if not FP16 else np.float16
+            dtype=np.float32 if args.bf16 else np.float16
         )
 
-    write_parquet(parquet_path, idxs, embeddings, bf16=(not FP16))
+    write_parquet(args.parquet_path, idxs, embeddings, bf16=args.bf16)
 
 
 if __name__ == "__main__":
