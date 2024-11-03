@@ -14,14 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 import json
 from pathlib import Path
 import sys
 from subprocess import Popen, PIPE
-from typing import TextIO, BinaryIO, Iterable, overload, Literal
+from typing import TextIO, BinaryIO, Iterable, Generator
 
 from filelock import FileLock
 import numpy as np
@@ -33,21 +33,23 @@ import torch
 from tqdm import tqdm
 
 
-def parse_args():
+def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
     parser.add_argument("parquet_path")
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-p", "--prompt-name", default=None)
     parser.add_argument("-t", "--tasks", default=2)
     parser.add_argument("-c", "--chunk-size", default=256)
-    parser.add_argument("--fp16", action="store_false", dest="bf16")
+    parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
     args = parser.parse_args()
     return args
 
 
-def get_model(model_name: str, bf16: bool, trust_remote_code: bool):
+def get_model(
+    model_name: str, bf16: bool, trust_remote_code: bool
+) -> SentenceTransformer:
     # start queries in parallel
     p1 = Popen(
         ["nvidia-smi", "--query-gpu=gpu_bus_id,index", "--format=csv,noheader"],
@@ -85,7 +87,9 @@ def get_model(model_name: str, bf16: bool, trust_remote_code: bool):
     return model
 
 
-def load_oajsonl_chunked(f: TextIO | BinaryIO, chunk_size: int):
+def load_oajsonl_chunked(
+    f: TextIO | BinaryIO, chunk_size: int
+) -> Generator[tuple[list[str], list[str]]]:
     idxs_chunk: list[str] = []
     documents_chunk: list[str] = []
     for line in f:
@@ -102,22 +106,26 @@ def load_oajsonl_chunked(f: TextIO | BinaryIO, chunk_size: int):
         yield idxs_chunk, documents_chunk
 
 
+# built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
 def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
     prompt: str | None,
     bf16: bool
-):
+) -> npt.NDArray:
     model.eval()
 
+    # if given a prompt, add it to the sentences
     features = {}
     if prompt is not None:
         sentences = [prompt + sentence for sentence in sentences]
 
+        # SentenceTransformers expects this feature if a prompt is used
         tokenized_prompt = model.tokenize([prompt])
         if "input_ids" in tokenized_prompt:
             features |= {"input_ids": tokenized_prompt["input_ids"].shape[-1] - 1}
 
+    # Tokenize (which yields a dict) then do a non-blocking transfer
     features |= {
         k: v.to(model.device, non_blocking=True)
         for k, v in model.tokenize(sentences).items()
@@ -127,21 +135,21 @@ def encode_faster(
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
 
+    # bf16 isn't supported by numpy, so go fp32 (won't lose data)
     if bf16:
-        # convert to float32 numpy to preserve all bits
-        return embeddings.float().cpu().numpy()
-    else:
-        return embeddings.cpu().numpy()
+        embeddings = embeddings.float()
+
+    return embeddings.cpu().numpy()
 
 
 def encode_pipelined(
     chunks: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
-    prompt: str,
+    prompt: str | None,
     bf16: bool,
     n_tasks: int,
     progress: bool,
-):
+) -> Generator[tuple[list[str], npt.NDArray]]:
     idxs_chunks = deque[list[str]]()
     embed_tasks = deque[Future[npt.NDArray]]()
     with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
@@ -165,24 +173,13 @@ def encode_pipelined(
             yield idxs_chunks.popleft(), embeddings_chunk
 
 
-@overload
-def write_parquet(
-    path: str, idxs: list[str], embeddings: npt.NDArray[np.float32], bf16: Literal[True]
-): ...
-
-
-@overload
-def write_parquet(
-    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: Literal[False]
-): ...
-
-
 def write_parquet(
     path: str, idxs: list[str], embeddings: npt.NDArray, bf16: bool
-):
+) -> None:
     if bf16 and embeddings.dtype != np.float32:
         raise ValueError("took bf16 path without passing an array promoted to float32")
 
+    # create pyarrow Arrays (embeddings flattened then passed with dim to constructor)
     _, dim = embeddings.shape
     idxs_arr = pa.array(idxs, pa.string())
     embed_arr = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), dim)
@@ -193,7 +190,10 @@ def write_parquet(
         # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
         # completely zero. Exploit this with byte-stream split and lz4 compression
         pq.write_table(
-            table, path, compression="lz4", use_byte_stream_split=["embeddings"]
+            table,
+            path,
+            compression="lz4",
+            use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
         )
     else:
         # otherwise, compressing float embeddings isn't worth it
