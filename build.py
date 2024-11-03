@@ -166,12 +166,12 @@ def write_parquet(
 
 @overload
 def write_parquet(
-    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: Literal[False] = False
+    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: Literal[False]
 ): ...
 
 
 def write_parquet(
-    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: bool = False
+    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: bool
 ):
     if bf16 and embeddings.dtype != np.float32:
         raise ValueError("took bf16 path without passing an array promoted to float32")
