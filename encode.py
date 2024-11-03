@@ -16,58 +16,65 @@
 
 from argparse import ArgumentParser, Namespace
 import os
+from typing import Generator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 
-SHARD_SIZE = 4194304  # (2^22), puts the shard size a bit under 4 GB
-
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("encode.py", description="Repartitions the embeddings.")
-    parser.add_argument("old_path")
-    parser.add_argument("new_path")
-    parser.add_argument("-s", "--shard-size")
+    parser.add_argument("source")
+    parser.add_argument("dest")
+    parser.add_argument("-s", "--shard-size", default=4194304)  # 2^22 is under 4GB
+    parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
 
 
-def take_shard(
-    idxs: list[pa.Array], embeddings: list[pa.Array], shards_path: str, shard_id: int
-) -> tuple[list[pa.Array], list[pa.Array]]:
-    idxs_concat = pa.concat_arrays(idxs)
-    embeddings_concat = pa.concat_arrays(embeddings)
+def exact_shards(dataset: ds.Dataset, size: int) -> Generator[pa.Array, None, None]:
+    counter = 0
+    idxs_batches: list[pa.RecordBatch] = []
+    embeddings_batches: list[pa.RecordBatch] = []
+    for batch in dataset.to_batches():
+        idxs_batches.append(batch["idxs"])
+        embeddings_batches.append(batch["embeddings"])
+        counter += len(batch)
 
-    # TODO: make the shard schema a literal
-    shard = pa.table(
-        [idxs_concat[:SHARD_SIZE], embeddings_concat[:SHARD_SIZE]],
-        names=["idxs", "embeddings"]
-    )
-    pq.write_table(
-        shard,
-        f"{shards_path}/data_{shard_id:03}.parquet",
-        compression="none"
-    )
+        while counter >= size:
+            idxs_concat = pa.concat_arrays(idxs_batches)
+            embeddings_concat = pa.concat_arrays(embeddings_batches)
+            yield idxs_concat[:size], embeddings_concat[:size]
 
-    return [idxs_concat[SHARD_SIZE:]], [embeddings_concat[SHARD_SIZE:]]
+            idxs_batches = [idxs_concat[size:]]
+            embeddings_batches = [embeddings_concat[size:]]
+            counter -= size
+
+    if counter:
+        idxs_concat = pa.concat_arrays(idxs_batches)
+        embeddings_concat = pa.concat_arrays(embeddings_batches)
+        yield idxs_concat, embeddings_concat
+
+
+def write_table(shard: pa.Table, path: str, bf16: bool) -> None:
+    if bf16:
+        pq.write_table(
+            shard,
+            path,
+            compression="lz4",
+            use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
+        )
+    else:
+        pq.write_table(shard, path, compression="none")
 
 
 def main():
     args = parse_args()
-
-    os.mkdir(args.new_path)
-
-    # merge the partial works tables
-    shard_id = 0
-    idxs = []
-    embeddings = []
-    for batch in ds.dataset(args.old_path).to_batches():
-        idxs.append(batch['idxs'])
-        embeddings.append(batch['embeddings'])
-        while len(idxs) >= SHARD_SIZE:
-            idxs, embeddings = take_shard(idxs, embeddings, args.new_path, shard_id)
-            shard_id += 1
-    _, _ = take_shard(idxs, embeddings, args.new_path, shard_id)
+    d = ds.dataset(args.source)
+    os.mkdir(args.dest)
+    for id_, (idxs_shard, embd_shard) in enumerate(exact_shards(d, args.shard_size)):
+        shard = pa.table([idxs_shard, embd_shard], names=["idxs", "embeddings"])
+        write_table(shard, f"{args.dest}/data_{id_:03}.parquet", args.bf16)
 
 
 if __name__ == "__main__":
