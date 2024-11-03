@@ -31,22 +31,21 @@ import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer
 import torch
 
-TRUST_REMOTE_CODE = False
-N_TASKS = 2
-CHUNK_SIZE = 256  # number of works to process at a time
-
 
 def parse_args():
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
     parser.add_argument("parquet_path")
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-p", "--prompt-name", default=None)
+    parser.add_argument("-t", "--tasks", default=2)
+    parser.add_argument("-c", "--chunk-size", default=256)
     parser.add_argument("--fp16", action="store_false", dest="bf16")
+    parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
     return args
 
 
-def get_model(model_name: str, bf16: bool):
+def get_model(model_name: str, bf16: bool, trust_remote_code: bool):
     # start queries in parallel
     p1 = Popen(
         ["nvidia-smi", "--query-gpu=gpu_bus_id,index", "--format=csv,noheader"],
@@ -77,7 +76,7 @@ def get_model(model_name: str, bf16: bool):
     model = SentenceTransformer(
         model_name,
         device=f"cuda:{selected_index}",
-        trust_remote_code=TRUST_REMOTE_CODE,
+        trust_remote_code=trust_remote_code,
         model_kwargs={"torch_dtype": torch.bfloat16 if bf16 else torch.float16}
     )
 
@@ -199,7 +198,7 @@ def main():
 
     # Get model with file lock to ensure next process will see this one
     with FileLock("/tmp/abstracts-search-gpu.lock"):
-        model = get_model(args.model_name, args.bf16)
+        model = get_model(args.model_name, args.bf16, args.trust_remote_code)
 
     if args.prompt_name is None:
         prompt = None
@@ -211,8 +210,8 @@ def main():
         print("model doesn't have exact embedding dim")
         exit(-1)
 
-    chunks = load_oajsonl_chunked(sys.stdin, CHUNK_SIZE)
-    chunks = encode_pipelined(chunks, model, prompt, args.bf16, N_TASKS)
+    chunks = load_oajsonl_chunked(sys.stdin, args.chunk_size)
+    chunks = encode_pipelined(chunks, model, prompt, args.bf16, args.tasks)
 
     idxs_chunks: list[list[str]] = []
     embeddings_chunks: list[npt.NDArray] = []

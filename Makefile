@@ -1,7 +1,7 @@
 SHELL := bash  # TODO: lift this requirement?
 MC := mc  # TODO: make aws cli an option?
 GZIP := pigz
-MODEL := all-MiniLM-L6-v2
+BUILDFLAGS := --model-name all-MiniLM-L6-v2
 CFLAGS := -O2
 
 # Rules cannot have equal signs in the target, so this is a workaround
@@ -19,7 +19,7 @@ encode_rule := 								\
   $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
   $(GZIP) -d | ./oa_jsonl | 						\
   conda run -n abstracts-search --live-stream python ./build.py 	\
-  --model-name $(MODEL) $$@
+  $(BUILDFLAGS) $$@
 
 include remote_targets.mk
 
