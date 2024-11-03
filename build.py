@@ -30,6 +30,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer
 import torch
+from tqdm import tqdm
 
 
 def parse_args():
@@ -41,6 +42,7 @@ def parse_args():
     parser.add_argument("-c", "--chunk-size", default=256)
     parser.add_argument("--fp16", action="store_false", dest="bf16")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("-P", "--progress", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -137,15 +139,18 @@ def encode_pipelined(
     model: SentenceTransformer,
     prompt: str,
     bf16: bool,
-    n_tasks: int
+    n_tasks: int,
+    progress: bool,
 ):
     idxs_chunks = deque[list[str]]()
     embed_tasks = deque[Future[npt.NDArray]]()
-    with ThreadPoolExecutor(n_tasks) as executor:
+    with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
         for idxs_chunk, documents_chunk in chunks:
             # clear out the task queue of completed tasks, then wait until there's room
             while (embed_tasks and embed_tasks[0].done()) or len(embed_tasks) > n_tasks:
-                yield idxs_chunks.popleft(), embed_tasks.popleft().result()
+                embeddings_chunk = embed_tasks.popleft().result()
+                count.update(len(embeddings_chunk))
+                yield idxs_chunks.popleft(), embeddings_chunk
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_chunks.append(idxs_chunk)
@@ -155,7 +160,9 @@ def encode_pipelined(
 
         # wait for the remaining tasks to finish
         while embed_tasks:
-            yield idxs_chunks.popleft(), embed_tasks.popleft().result()
+            embeddings_chunk = embed_tasks.popleft().result()
+            count.update(len(embeddings_chunk))
+            yield idxs_chunks.popleft(), embeddings_chunk
 
 
 @overload
@@ -211,7 +218,9 @@ def main():
         exit(-1)
 
     chunks = load_oajsonl_chunked(sys.stdin.buffer, args.chunk_size)
-    chunks = encode_pipelined(chunks, model, prompt, args.bf16, args.tasks)
+    chunks = encode_pipelined(
+        chunks, model, prompt, args.bf16, args.tasks, args.progress
+    )
 
     idxs_chunks: list[list[str]] = []
     embeddings_chunks: list[npt.NDArray] = []
