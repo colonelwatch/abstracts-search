@@ -42,17 +42,19 @@ def exact_shards(dataset: ds.Dataset, size: int) -> Generator[pa.Array, None, No
         counter += len(batch)
 
         while counter >= size:
-            idxs_concat = pa.concat_arrays(idxs_batches)
-            embeddings_concat = pa.concat_arrays(embeddings_batches)
+            # emit a no-copy concatenation of the chunks
+            idxs_concat = pa.chunked_array(idxs_batches)
+            embeddings_concat = pa.chunked_array(embeddings_batches)
             yield idxs_concat[:size], embeddings_concat[:size]
 
-            idxs_batches = [idxs_concat[size:]]
-            embeddings_batches = [embeddings_concat[size:]]
+            # drop the chunks (eventually), but take a copy of the remainder
+            idxs_batches = [idxs_concat[size:].combine_chunks()]
+            embeddings_batches = [embeddings_concat[size:].combine_chunks()]
             counter -= size
 
     if counter:
-        idxs_concat = pa.concat_arrays(idxs_batches)
-        embeddings_concat = pa.concat_arrays(embeddings_batches)
+        idxs_concat = pa.chunked_array(idxs_batches)
+        embeddings_concat = pa.chunked_array(embeddings_batches)
         yield idxs_concat, embeddings_concat
 
 
