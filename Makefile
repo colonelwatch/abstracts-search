@@ -1,7 +1,6 @@
 SHELL := bash  # TODO: lift this requirement?
 MC := mc  # TODO: make aws cli an option?
 GZIP := pigz
-BUILDFLAGS := --model-name all-MiniLM-L6-v2
 CFLAGS := -O2
 
 # Rules cannot have equal signs in the target, so this is a workaround
