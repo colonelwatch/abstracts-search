@@ -38,8 +38,8 @@ def parse_args() -> Namespace:
     parser.add_argument("parquet_path")
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-p", "--prompt-name", default=None)
-    parser.add_argument("-t", "--tasks", default=2)
-    parser.add_argument("-c", "--chunk-size", default=256)
+    parser.add_argument("-t", "--tasks", default=2, type=int)
+    parser.add_argument("-c", "--chunk-size", default=256, type=int)
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
