@@ -39,7 +39,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-p", "--prompt-name", default=None)
     parser.add_argument("-t", "--tasks", default=2, type=int)
-    parser.add_argument("-c", "--chunk-size", default=256, type=int)
+    parser.add_argument("-b", "--batch-size", default=256, type=int)
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
@@ -89,23 +89,23 @@ def get_model(
     return model
 
 
-def load_oajsonl_chunked(
-    f: TextIO | BinaryIO, chunk_size: int
+def load_oajsonl_batched(
+    f: TextIO | BinaryIO, batch_size: int
 ) -> Generator[tuple[list[str], list[str]], None, None]:
-    idxs_chunk: list[str] = []
-    documents_chunk: list[str] = []
+    idxs_batch: list[str] = []
+    documents_batch: list[str] = []
     for line in f:
         row = json.loads(line)
 
-        idxs_chunk.append(row["id"])
-        documents_chunk.append(row["document"])
-        if len(documents_chunk) >= chunk_size:
-            yield idxs_chunk, documents_chunk
-            idxs_chunk = []
-            documents_chunk = []
+        idxs_batch.append(row["id"])
+        documents_batch.append(row["document"])
+        if len(documents_batch) >= batch_size:
+            yield idxs_batch, documents_batch
+            idxs_batch = []
+            documents_batch = []
 
-    if documents_chunk:
-        yield idxs_chunk, documents_chunk
+    if documents_batch:
+        yield idxs_batch, documents_batch
 
 
 # built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
@@ -145,34 +145,34 @@ def encode_faster(
 
 
 def encode_pipelined(
-    chunks: Iterable[tuple[list[str], list[str]]],
+    batches: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
     prompt: str | None,
     bf16: bool,
     n_tasks: int,
     progress: bool,
 ) -> Generator[tuple[list[str], npt.NDArray], None, None]:
-    idxs_chunks = deque[list[str]]()
+    idxs_batches = deque[list[str]]()
     embed_tasks = deque[Future[npt.NDArray]]()
     with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
-        for idxs_chunk, documents_chunk in chunks:
+        for idxs_batch, documents_batch in batches:
             # clear out the task queue of completed tasks, then wait until there's room
             while (embed_tasks and embed_tasks[0].done()) or len(embed_tasks) > n_tasks:
-                embeddings_chunk = embed_tasks.popleft().result()
-                count.update(len(embeddings_chunk))
-                yield idxs_chunks.popleft(), embeddings_chunk
+                embeddings_batch = embed_tasks.popleft().result()
+                count.update(len(embeddings_batch))
+                yield idxs_batches.popleft(), embeddings_batch
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
-            idxs_chunks.append(idxs_chunk)
+            idxs_batches.append(idxs_batch)
             embed_tasks.append(
-                executor.submit(encode_faster, model, documents_chunk, prompt, bf16)
+                executor.submit(encode_faster, model, documents_batch, prompt, bf16)
             )
 
         # wait for the remaining tasks to finish
         while embed_tasks:
-            embeddings_chunk = embed_tasks.popleft().result()
-            count.update(len(embeddings_chunk))
-            yield idxs_chunks.popleft(), embeddings_chunk
+            embeddings_batch = embed_tasks.popleft().result()
+            count.update(len(embeddings_batch))
+            yield idxs_batches.popleft(), embeddings_batch
 
 
 def write_parquet(
@@ -219,21 +219,21 @@ def main():
         print("model doesn't have exact embedding dim")
         exit(-1)
 
-    chunks = load_oajsonl_chunked(sys.stdin.buffer, args.chunk_size)
-    chunks = encode_pipelined(
-        chunks, model, prompt, args.bf16, args.tasks, args.progress
+    batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
+    batches = encode_pipelined(
+        batches, model, prompt, args.bf16, args.tasks, args.progress
     )
 
-    idxs_chunks: list[list[str]] = []
-    embeddings_chunks: list[npt.NDArray] = []
-    for idxs_chunk, embeddings_chunk in chunks:
-        idxs_chunks.append(idxs_chunk)
-        embeddings_chunks.append(embeddings_chunk)
+    idxs_batches: list[list[str]] = []
+    embeddings_batches: list[npt.NDArray] = []
+    for idxs_batch, embeddings_batch in batches:
+        idxs_batches.append(idxs_batch)
+        embeddings_batches.append(embeddings_batch)
 
-    # merge chunks
-    idxs = [idx for idxs_chunk in idxs_chunks for idx in idxs_chunk]
-    if embeddings_chunks:
-        embeddings = np.vstack(embeddings_chunks)
+    # merge batches
+    idxs = [idx for idxs_batch in idxs_batches for idx in idxs_batch]
+    if embeddings_batches:
+        embeddings = np.vstack(embeddings_batches)
     else:
         embeddings = np.empty(
             (0, embedding_dim),
