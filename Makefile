@@ -6,6 +6,9 @@ CFLAGS := -O2
 # Rules cannot have equal signs in the target, so this is a workaround
 EQ := =
 
+abstracts-index/index: abstracts-embeddings/data
+	conda run -n abstracts-search --live-stream python ./train.py $< $@
+
 abstracts-embeddings/data: works
 	conda run -n abstracts-search --live-stream python ./encode.py $< $@
 
@@ -45,9 +48,11 @@ remote_targets.mk: Makefile  # emits works as a target
 	cat $$rule | sed -e "s/=/\$$\(EQ\)/" > $@; 				\
 	cat $$parts | sed -e "s/=/\$$\(EQ\)/" >> $@
 
+# TODO: make train.py working directory configurable and remove it in make clean?
 .PHONY: clean
 clean:
 	rm -rf works
 	rm -rf abstracts-embeddings/data
+	rm -rf abstracts-index/index
 	rm -f remote_targets.mk
 	rm -f oa_jsonl
