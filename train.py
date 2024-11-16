@@ -69,23 +69,32 @@ def splits(
 
 
 def create_memmap(
-    path: Path, dataset: Dataset, batch_size: int
+    working_dir: Path, dataset: Dataset, batch_size: int
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
     d = len(dataset[0]["embeddings"])
-    memmap = np.memmap(path, np.float32, mode="w+", shape=(n, d))
+    shape = (n, d)
 
-    with dataset.formatted_as("numpy", columns=["embeddings"]):
-        counter = 0
-        for batch in dataset.iter(batch_size):
-            embeddings_batch: npt.NDArray = batch["embeddings"]  # type: ignore
+    cache_path = working_dir / f"train_{dataset._fingerprint}.memmap"
+    if cache_path.exists():
+        return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
-            n_batch = len(embeddings_batch)
-            memmap[counter:(counter + n_batch)] = embeddings_batch
-            counter += n_batch
+    memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
+    try:
+        with dataset.formatted_as("numpy", columns=["embeddings"]):
+            counter = 0
+            for batch in dataset.iter(batch_size):
+                embeddings_batch: npt.NDArray = batch["embeddings"]  # type: ignore
+
+                n_batch = len(embeddings_batch)
+                memmap[counter:(counter + n_batch)] = embeddings_batch
+                counter += n_batch
+    except KeyboardInterrupt:
+        cache_path.unlink()
+        raise
 
     memmap.flush()
-    return np.memmap(path, np.float32, mode="r", shape=(n, d))
+    return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
 
 # TODO: multithread?
@@ -244,7 +253,7 @@ def main():
         working_dir, dataset, validation, args.batch_size, args.intersection
     )
 
-    train_memmap = create_memmap(working_dir / "train.memmap", train, args.batch_size)
+    train_memmap = create_memmap(working_dir, train, args.batch_size)
 
     faiss_index = train_index(
         train_memmap, "OPQ64_256,IVF131072,PQ64", args.inner_product
