@@ -159,6 +159,19 @@ def make_ground_truth(
     return ground_truth
 
 
+def to_gpu(index: faiss.Index, fp16: bool | None = None) -> faiss.Index:
+    # TODO: infer fp16 for code sizes 56 and over?
+    opts = faiss.GpuClonerOptions()
+    if fp16:
+        opts.useFloat16 = True
+    env = faiss.StandardGpuResources()
+    return faiss.index_cpu_to_gpu(env, 0, index, opts)
+
+
+def to_cpu(index: faiss.Index) -> faiss.Index:
+    return faiss.index_gpu_to_cpu(index)
+
+
 def train_index(
     embeddings: npt.NDArray[np.float32] | np.memmap[Any, np.dtype[np.float32]],
     factory_string: str,
@@ -168,10 +181,9 @@ def train_index(
     metric = faiss.METRIC_INNER_PRODUCT if inner_product else faiss.METRIC_L2
     index: faiss.Index = faiss.index_factory(d, factory_string, metric)
 
-    gpu_env = faiss.StandardGpuResources()
-    index = faiss.index_cpu_to_gpu(gpu_env, 0, index)
+    index = to_gpu(index, True)
     index.train(embeddings)  # type: ignore (monkey-patched)
-    index = faiss.index_gpu_to_cpu(index)
+    index = to_cpu(index)
 
     return index
 
@@ -180,13 +192,12 @@ def fill_index(
     dataset: Dataset, trained_index: faiss.Index, batch_size: int
 ) -> faiss.Index:
     # fill the index on the gpu, using the dataset, then restore the dataset's state
-    gpu_env = faiss.StandardGpuResources()
-    on_gpu = faiss.index_cpu_to_gpu(gpu_env, 0, trained_index)
+    on_gpu = to_gpu(trained_index, True)
     dataset.add_faiss_index(
         "embeddings", custom_index=on_gpu, batch_size=batch_size
     )
     dataset.drop_index("embeddings")
-    return faiss.index_gpu_to_cpu(on_gpu)
+    return to_cpu(on_gpu)
 
 
 def tune_index(
@@ -258,7 +269,6 @@ def main():
     faiss_index = train_index(
         train_memmap, "OPQ64_256,IVF131072,PQ64", args.inner_product
     )
-    # faiss_index = train_index(train_memmap, "OPQ32_128,IVF4096,PQ32", True)
     index = fill_index(dataset, faiss_index, args.batch_size)
     optimal_params = tune_index(index, ground_truth, args.intersection)
 
