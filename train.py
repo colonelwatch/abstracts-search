@@ -30,10 +30,11 @@ def parse_args() -> Namespace:
     parser.add_argument("-w", "--working-dir", default="splits", type=Path)
     parser.add_argument("-i", "--inner-product", action="store_true")
     parser.add_argument("-k", "--intersection", default=10, type=int)
-    parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-c", "--clusters", default=131072, type=int)  # TODO: raise
     parser.add_argument("-q", "--queries", default=16384, type=int)
-    parser.add_argument("--truncate", default=None, type=int)
+    parser.add_argument("-b", "--batch-size", default=1024, type=int)
+    parser.add_argument("-P", "--progress", action="store_true")
+    parser.add_argument("-t", "--truncate", default=None, type=int)
     return parser.parse_args()
 
 
@@ -59,7 +60,7 @@ def splits(
 
 
 def create_memmap(
-    working_dir: Path, dataset: Dataset, batch_size: int
+    working_dir: Path, dataset: Dataset, batch_size: int, progress: bool
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
     d = len(dataset[0]["embeddings"])
@@ -73,7 +74,7 @@ def create_memmap(
     try:
         with (
             dataset.formatted_as("numpy", columns=["embeddings"]),
-            tqdm(total=len(dataset)) as counter
+            tqdm(total=len(dataset), disable=(not progress)) as counter
         ):
             i = 0
             for batch in dataset.iter(batch_size):
@@ -100,6 +101,7 @@ def make_ground_truth(
     batch_size: int,
     k: int,
     inner_product: bool,
+    progress: bool,
 ) -> Dataset:
     h = Hasher()
     h.update(dataset._fingerprint)
@@ -128,7 +130,7 @@ def make_ground_truth(
     gt_ids = torch.full((n_q, k), -1, dtype=torch.int32).cuda()
     with (
         dataset.formatted_as("torch", columns=["embeddings", "ids"]),
-        tqdm(total=(len(dataset) - len(queries))) as counter,
+        tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter,
     ):
         for batch in dataset.iter(batch_size):
             d_batch: torch.Tensor = batch["embeddings"]  # type: ignore
@@ -211,7 +213,7 @@ def fill_index(
 
 
 def tune_index(
-    filled_index: faiss.Index, ground_truth: Dataset, k: int
+    filled_index: faiss.Index, ground_truth: Dataset, k: int, progress: bool
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
         q: npt.NDArray[np.float32] = ground_truth["embeddings"]  # type: ignore
@@ -223,7 +225,7 @@ def tune_index(
     criterion.set_groundtruth(None, gt_ids)  # type: ignore (monkey-patched)
 
     params = faiss.ParameterSpace()
-    params.verbose = False  # TODO: control verbosity
+    params.verbose = progress
     params.initialize(filled_index)
     results: faiss.OperatingPoints = params.explore(  # type: ignore (monkey-patched)
         filled_index, q, criterion
@@ -277,14 +279,15 @@ def main():
         queries,
         args.batch_size,
         args.intersection,
-        args.inner_product
+        args.inner_product,
+        args.progress,
     )
 
-    train_memmap = create_memmap(working_dir, train, args.batch_size)
+    train_memmap = create_memmap(working_dir, train, args.batch_size, args.progress)
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
     index = fill_index(dataset, faiss_index, args.batch_size)
-    optimal_params = tune_index(index, ground_truth, args.intersection)
+    optimal_params = tune_index(index, ground_truth, args.intersection, args.progress)
 
     save_ids(args.dest / "ids.parquet", dataset, args.batch_size)
     save_optimal_params(args.dest / "params.json", optimal_params)
