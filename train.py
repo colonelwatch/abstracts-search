@@ -94,13 +94,19 @@ def create_memmap(
 
 # TODO: multithread?
 def make_ground_truth(
-    working_dir: Path, dataset: Dataset, queries: Dataset, batch_size: int, k: int
+    working_dir: Path,
+    dataset: Dataset,
+    queries: Dataset,
+    batch_size: int,
+    k: int,
+    inner_product: bool,
 ) -> Dataset:
     h = Hasher()
     h.update(dataset._fingerprint)
     h.update(queries._fingerprint)
     h.update(batch_size)
     h.update(k)
+    h.update(inner_product)
     cache_identifier = h.hexdigest()
     cache_path = working_dir / f"gt_{cache_identifier}"
     if cache_path.exists():
@@ -115,7 +121,10 @@ def make_ground_truth(
     q_ids = q_ids.cuda()
 
     n_q, _ = q.shape
-    gt_scores = torch.zeros((n_q, k), dtype=torch.float32).cuda()
+    if inner_product:
+        gt_scores = torch.zeros((n_q, k), dtype=torch.float32).cuda()
+    else:
+        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32).cuda()
     gt_ids = torch.full((n_q, k), -1, dtype=torch.int32).cuda()
     with (
         dataset.formatted_as("torch", columns=["embeddings", "ids"]),
@@ -132,14 +141,22 @@ def make_ground_truth(
             d_batch = d_batch[not_in_queries]
             d_batch_ids = d_batch_ids[not_in_queries]
 
-            scores_batch = q @ d_batch.T
+            if inner_product:
+                scores_batch = q @ d_batch.T
+                largest = True
+            else:
+                # prefer direct calc over following the quadratic form with matmult
+                scores_batch = torch.cdist(
+                    q, d_batch, compute_mode="donot_use_mm_for_euclid_dist"
+                )
+                largest = False
 
-            top_scores_batch, argtop = torch.topk(scores_batch, k, dim=1)
+            top_scores_batch, argtop = torch.topk(scores_batch, k, 1, largest)
             top_ids_batch = d_batch_ids[argtop.flatten()].reshape(argtop.shape)
 
             gt_scores = torch.hstack((gt_scores, top_scores_batch))
             gt_ids = torch.hstack((gt_ids, top_ids_batch))
-            gt_scores, argtop = torch.topk(gt_scores, k, dim=1)
+            gt_scores, argtop = torch.topk(gt_scores, k, 1, largest)
             gt_ids = torch.gather(gt_ids, 1, argtop)
 
             counter.update(len(d_batch))
@@ -250,12 +267,17 @@ def main():
         dataset = dataset.take(truncate)
 
     clusters: int = args.clusters
-    factory_string = f"OPQ64_128,IVF{clusters},PQ64"
+    factory_string = f"OPQ64_256,IVF{clusters},PQ64"
     train_size = TRAIN_SIZE_MULTIPLE * clusters
 
     train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
-        working_dir, dataset, queries, args.batch_size, args.intersection
+        working_dir,
+        dataset,
+        queries,
+        args.batch_size,
+        args.intersection,
+        args.inner_product
     )
 
     train_memmap = create_memmap(working_dir, train, args.batch_size)
