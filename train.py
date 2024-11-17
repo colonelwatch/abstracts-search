@@ -79,8 +79,8 @@ def create_memmap(
             i = 0
             for batch in dataset.iter(batch_size):
                 embeddings_batch: npt.NDArray = batch["embeddings"]  # type: ignore
-
                 n_batch = len(embeddings_batch)
+
                 memmap[i:(i + n_batch)] = embeddings_batch
                 i += n_batch
 
