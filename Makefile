@@ -35,6 +35,7 @@ oa_jsonl: oa_jsonl.c
 # Creates individual rules for each remote updated=XXXX-XX-XX/part-XXX.gz file and a
 # rule with all the targets as prereqs. Each rule is an instance of encode_rule.
 remote_targets.mk: Makefile  # emits works as a target
+	rm -f remote_targets.mk
 	set -e; 								\
 	parts=$$(mktemp); 							\
 	rule=$$(mktemp); 							\
