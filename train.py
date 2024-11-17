@@ -29,9 +29,8 @@ def parse_args() -> Namespace:
     parser.add_argument("-i", "--inner-product", action="store_true")
     parser.add_argument("-k", "--intersection", default=10, type=int)
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
-    parser.add_argument("--train-size", default=6291456, type=int)  # hangups past this?
-    parser.add_argument("--test-size", default=16384, type=int)
-    parser.add_argument("--validation-size", default=None)
+    parser.add_argument("-c", "--clusters", default=131072, type=int)  # TODO: raise
+    parser.add_argument("-q", "--queries", default=16384, type=int)
     parser.add_argument("--truncate", default=None, type=int)
     return parser.parse_args()
 
@@ -51,21 +50,10 @@ def splits(
     dataset: Dataset,
     train_size: int,
     test_size: int,
-    validation_size: int | None,
     seed: int = 42
-) -> tuple[Dataset, Dataset, Dataset]:
-    if validation_size is None:
-        validation_size = test_size
-    total_test_size = validation_size + test_size
-    splits_0 = dataset.train_test_split(total_test_size, train_size, seed=seed)
-    splits_1 = splits_0["test"].train_test_split(test_size, validation_size, seed=seed)
-
-    train = splits_0["train"]
-    validation = splits_1["train"]
-    test = splits_1["test"]
-
-    # result: three sets of indices, indexing one underlying file
-    return train, validation, test
+) -> tuple[Dataset, Dataset]:
+    splits = dataset.train_test_split(test_size, train_size, seed=seed)
+    return splits["train"], splits["test"]  # result: two sets of indices, one file
 
 
 def create_memmap(
@@ -159,11 +147,9 @@ def make_ground_truth(
     return ground_truth
 
 
-def to_gpu(index: faiss.Index, fp16: bool | None = None) -> faiss.Index:
-    # TODO: infer fp16 for code sizes 56 and over?
+def to_gpu(index: faiss.Index) -> faiss.Index:
     opts = faiss.GpuClonerOptions()
-    if fp16:
-        opts.useFloat16 = True
+    opts.useFloat16 = True  # float16 is necessary for codes sized 56 bits and over
     env = faiss.StandardGpuResources()
     return faiss.index_cpu_to_gpu(env, 0, index, opts)
 
@@ -181,7 +167,7 @@ def train_index(
     metric = faiss.METRIC_INNER_PRODUCT if inner_product else faiss.METRIC_L2
     index: faiss.Index = faiss.index_factory(d, factory_string, metric)
 
-    index = to_gpu(index, True)
+    index = to_gpu(index)
     index.train(embeddings)  # type: ignore (monkey-patched)
     index = to_cpu(index)
 
@@ -192,7 +178,7 @@ def fill_index(
     dataset: Dataset, trained_index: faiss.Index, batch_size: int
 ) -> faiss.Index:
     # fill the index on the gpu, using the dataset, then restore the dataset's state
-    on_gpu = to_gpu(trained_index, True)
+    on_gpu = to_gpu(trained_index)
     dataset.add_faiss_index(
         "embeddings", custom_index=on_gpu, batch_size=batch_size
     )
@@ -256,19 +242,18 @@ def main():
     if truncate is not None:
         dataset = dataset.take(truncate)
 
-    # TODO: come up with some scheme for the test split?
-    train, validation, _ = splits(
-        dataset, args.train_size, args.test_size, args.validation_size
-    )
+    clusters: int = args.clusters
+    factory_string = f"OPQ64_128,IVF{clusters},PQ64"
+    train_size = 50 * clusters
+
+    train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
-        working_dir, dataset, validation, args.batch_size, args.intersection
+        working_dir, dataset, queries, args.batch_size, args.intersection
     )
 
     train_memmap = create_memmap(working_dir, train, args.batch_size)
 
-    faiss_index = train_index(
-        train_memmap, "OPQ64_256,IVF131072,PQ64", args.inner_product
-    )
+    faiss_index = train_index(train_memmap, factory_string, args.inner_product)
     index = fill_index(dataset, faiss_index, args.batch_size)
     optimal_params = tune_index(index, ground_truth, args.intersection)
 
