@@ -1,19 +1,22 @@
 SHELL := bash  # TODO: lift this requirement?
 MC := mc  # TODO: make aws cli an option?
 GZIP := pigz
+
+WORKING_DIR := splits
+
 CFLAGS := -O2
+TRAINFLAGS := -w $(WORKING_DIR)
 
 # Rules cannot have equal signs in the target, so this is a workaround
 EQ := =
 
 abstracts-index/index: abstracts-embeddings/data
-	conda run -n abstracts-search --live-stream python ./train.py $< $@
+	conda run -n abstracts-search --live-stream python ./train.py 	\
+	$(TRAINFLAGS) $< $@
 
 abstracts-embeddings/data: works
-	conda run -n abstracts-search --live-stream python ./encode.py $< $@
-
-oa_jsonl: oa_jsonl.c
-	$(CC) $(CFLAGS) -o $@ $<
+	conda run -n abstracts-search --live-stream python ./encode.py 	\
+	$(ENCODEFLAGS) $< $@
 
 # A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
 encode_rule := 								\
@@ -24,6 +27,9 @@ encode_rule := 								\
   $(BUILDFLAGS) $$@
 
 include remote_targets.mk
+
+oa_jsonl: oa_jsonl.c
+	$(CC) $(CFLAGS) -o $@ $<
 
 # mcli alias set publics3 https://s3.amazonaws.com "" ""
 # Creates individual rules for each remote updated=XXXX-XX-XX/part-XXX.gz file and a
@@ -52,6 +58,7 @@ remote_targets.mk: Makefile  # emits works as a target
 .PHONY: clean
 clean:
 	rm -rf works
+	rm -rf $(WORKING_DIR)
 	rm -rf abstracts-embeddings/data
 	rm -rf abstracts-index/index
 	rm -f remote_targets.mk
