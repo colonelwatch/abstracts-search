@@ -12,6 +12,8 @@ import numpy.typing as npt
 import torch
 from tqdm import tqdm
 
+TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,14 +71,19 @@ def create_memmap(
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        with dataset.formatted_as("numpy", columns=["embeddings"]):
-            counter = 0
+        with (
+            dataset.formatted_as("numpy", columns=["embeddings"]),
+            tqdm(total=len(dataset)) as counter
+        ):
+            i = 0
             for batch in dataset.iter(batch_size):
                 embeddings_batch: npt.NDArray = batch["embeddings"]  # type: ignore
 
                 n_batch = len(embeddings_batch)
-                memmap[counter:(counter + n_batch)] = embeddings_batch
-                counter += n_batch
+                memmap[i:(i + n_batch)] = embeddings_batch
+                i += n_batch
+
+                counter.update(n_batch)
     except KeyboardInterrupt:
         cache_path.unlink()
         raise
@@ -244,7 +251,7 @@ def main():
 
     clusters: int = args.clusters
     factory_string = f"OPQ64_128,IVF{clusters},PQ64"
-    train_size = 50 * clusters
+    train_size = TRAIN_SIZE_MULTIPLE * clusters
 
     train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
