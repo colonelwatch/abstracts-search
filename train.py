@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, TypedDict
 
-from datasets import Dataset
+from datasets import Dataset, disable_progress_bars
 from datasets.fingerprint import Hasher
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
 import numpy as np
@@ -259,6 +259,10 @@ def save_optimal_params(path: Path, optimal_params: list[IndexParameters]):
 def main():
     args = parse_args()
 
+    progress: bool = args.progress
+    if not progress:
+        disable_progress_bars()
+
     working_dir: Path = args.working_dir
     working_dir.mkdir(exist_ok=True)
 
@@ -280,14 +284,14 @@ def main():
         args.batch_size,
         args.intersection,
         args.inner_product,
-        args.progress,
+        progress,
     )
 
-    train_memmap = create_memmap(working_dir, train, args.batch_size, args.progress)
+    train_memmap = create_memmap(working_dir, train, args.batch_size, progress)
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
     index = fill_index(dataset, faiss_index, args.batch_size)
-    optimal_params = tune_index(index, ground_truth, args.intersection, args.progress)
+    optimal_params = tune_index(index, ground_truth, args.intersection, progress)
 
     save_ids(args.dest / "ids.parquet", dataset, args.batch_size)
     save_optimal_params(args.dest / "params.json", optimal_params)
