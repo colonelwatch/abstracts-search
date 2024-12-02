@@ -34,7 +34,6 @@ def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
     parser.add_argument("data_path", type=Path)
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
-    parser.add_argument("-p", "--prompt-name", default=None)
     parser.add_argument("-t", "--tasks", default=2, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
@@ -109,22 +108,11 @@ def load_oajsonl_batched(
 def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
-    prompt: str | None,
 ) -> torch.Tensor:
     model.eval()
 
-    # if given a prompt, add it to the sentences
-    features = {}
-    if prompt is not None:
-        sentences = [prompt + sentence for sentence in sentences]
-
-        # SentenceTransformers expects this feature if a prompt is used
-        tokenized_prompt = model.tokenize([prompt])
-        if "input_ids" in tokenized_prompt:
-            features |= {"input_ids": tokenized_prompt["input_ids"].shape[-1] - 1}
-
     # Tokenize (which yields a dict) then do a non-blocking transfer
-    features |= {
+    features = {
         k: v.to(model.device, non_blocking=True)
         for k, v in model.tokenize(sentences).items()
     }
@@ -139,7 +127,6 @@ def encode_faster(
 def encode_pipelined(
     batches: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
-    prompt: str | None,
     n_tasks: int,
     progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
@@ -155,9 +142,7 @@ def encode_pipelined(
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_batches.append(idxs_batch)
-            embed_tasks.append(
-                executor.submit(encode_faster, model, documents_batch, prompt)
-            )
+            embed_tasks.append(executor.submit(encode_faster, model, documents_batch))
 
         # wait for the remaining tasks to finish
         while embed_tasks:
@@ -179,18 +164,13 @@ def main():
     with FileLock("/tmp/abstracts-search-gpu.lock"):
         model = get_model(args.model_name, args.bf16, args.trust_remote_code)
 
-    if args.prompt_name is None:
-        prompt = None
-    else:
-        prompt = model.prompts[args.prompt_name]
-
     embedding_dim = model.get_sentence_embedding_dimension()
     if embedding_dim is None:
         print("model doesn't have exact embedding dim")
         exit(-1)
 
     batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
-    batches = encode_pipelined(batches, model, prompt, args.tasks, args.progress)
+    batches = encode_pipelined(batches, model, args.tasks, args.progress)
 
     idxs_batches: list[list[str]] = []
     embeddings_batches: list[torch.Tensor] = []
