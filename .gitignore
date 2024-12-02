@@ -1,4 +1,5 @@
-works
+data.sqlite
+events
 splits
 remote_targets.mk
 .vscode

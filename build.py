@@ -21,13 +21,10 @@ import json
 from pathlib import Path
 import sys
 from subprocess import Popen, PIPE
+import sqlite3
 from typing import TextIO, BinaryIO, Iterable, Generator
 
 from filelock import FileLock
-import numpy as np
-import numpy.typing as npt
-import pyarrow as pa
-import pyarrow.parquet as pq
 from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
@@ -35,7 +32,7 @@ from tqdm import tqdm
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
-    parser.add_argument("parquet_path")
+    parser.add_argument("data_path", type=Path)
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-p", "--prompt-name", default=None)
     parser.add_argument("-t", "--tasks", default=2, type=int)
@@ -113,8 +110,7 @@ def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
     prompt: str | None,
-    bf16: bool
-) -> npt.NDArray:
+) -> torch.Tensor:
     model.eval()
 
     # if given a prompt, add it to the sentences
@@ -137,23 +133,18 @@ def encode_faster(
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
 
-    # bf16 isn't supported by numpy, so go fp32 (won't lose data)
-    if bf16:
-        embeddings = embeddings.float()
-
-    return embeddings.cpu().numpy()
+    return embeddings.cpu()
 
 
 def encode_pipelined(
     batches: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
     prompt: str | None,
-    bf16: bool,
     n_tasks: int,
     progress: bool,
-) -> Generator[tuple[list[str], npt.NDArray], None, None]:
+) -> Generator[tuple[list[str], torch.Tensor], None, None]:
     idxs_batches = deque[list[str]]()
-    embed_tasks = deque[Future[npt.NDArray]]()
+    embed_tasks = deque[Future[torch.Tensor]]()
     with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
         for idxs_batch, documents_batch in batches:
             # clear out the task queue of completed tasks, then wait until there's room
@@ -165,7 +156,7 @@ def encode_pipelined(
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_batches.append(idxs_batch)
             embed_tasks.append(
-                executor.submit(encode_faster, model, documents_batch, prompt, bf16)
+                executor.submit(encode_faster, model, documents_batch, prompt)
             )
 
         # wait for the remaining tasks to finish
@@ -175,31 +166,10 @@ def encode_pipelined(
             yield idxs_batches.popleft(), embeddings_batch
 
 
-def write_parquet(
-    path: str, idxs: list[str], embeddings: npt.NDArray, bf16: bool
-) -> None:
-    if bf16 and embeddings.dtype != np.float32:
-        raise ValueError("took bf16 path without passing an array promoted to float32")
-
-    # create pyarrow Arrays (embeddings flattened then passed with dim to constructor)
-    _, dim = embeddings.shape
-    idxs_arr = pa.array(idxs, pa.string())
-    embed_arr = pa.FixedSizeListArray.from_arrays(embeddings.reshape(-1), dim)
-    table = pa.Table.from_arrays([idxs_arr, embed_arr], names=["idxs", "embeddings"])
-
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    if bf16:
-        # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
-        # completely zero. Exploit this with byte-stream split and lz4 compression
-        pq.write_table(
-            table,
-            path,
-            compression="lz4",
-            use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
-        )
-    else:
-        # otherwise, compressing float embeddings isn't worth it
-        pq.write_table(table, path, compression="none")
+def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
+    if vect.dtype == torch.bfloat16:
+        vect = vect.view(torch.uint16)
+    return vect.numpy().data
 
 
 def main():
@@ -220,27 +190,30 @@ def main():
         exit(-1)
 
     batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
-    batches = encode_pipelined(
-        batches, model, prompt, args.bf16, args.tasks, args.progress
-    )
+    batches = encode_pipelined(batches, model, prompt, args.tasks, args.progress)
 
     idxs_batches: list[list[str]] = []
-    embeddings_batches: list[npt.NDArray] = []
+    embeddings_batches: list[torch.Tensor] = []
     for idxs_batch, embeddings_batch in batches:
         idxs_batches.append(idxs_batch)
         embeddings_batches.append(embeddings_batch)
 
-    # merge batches
-    idxs = [idx for idxs_batch in idxs_batches for idx in idxs_batch]
-    if embeddings_batches:
-        embeddings = np.vstack(embeddings_batches)
-    else:
-        embeddings = np.empty(
-            (0, embedding_dim),
-            dtype=np.float32 if args.bf16 else np.float16
-        )
-
-    write_parquet(args.parquet_path, idxs, embeddings, bf16=args.bf16)
+    sqlite3.register_adapter(torch.Tensor, to_sql_binary)
+    with sqlite3.connect(
+        args.data_path,
+        isolation_level="EXCLUSIVE",
+        autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
+    ) as conn:
+        for idxs_batch, embeddings_batch in zip(idxs_batches, embeddings_batches):
+            tups = [
+                (idx, embedding) for idx, embedding
+                in zip(idxs_batch, embeddings_batch)
+            ]
+            conn.executemany(
+                "INSERT INTO embeddings VALUES(?, ?) "
+                "ON CONFLICT(oa_id) DO UPDATE SET embedding=excluded.embedding",
+                tups
+            )
 
 
 if __name__ == "__main__":

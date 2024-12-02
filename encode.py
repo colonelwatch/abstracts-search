@@ -1,4 +1,4 @@
-# encode.py
+# encode.py  TODO: rename to dump.py?
 
 # Copyright 2024 Kenny Peng
 #
@@ -15,68 +15,98 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
-import os
+from pathlib import Path
+import sqlite3
 from typing import Generator
 
+import numpy as np
+import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pyarrow.dataset as ds
+import torch
 
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("encode.py", description="Repartitions the embeddings.")
-    parser.add_argument("source")
-    parser.add_argument("dest")
+    parser.add_argument("source", type=Path)
+    parser.add_argument("dest", type=Path)
     parser.add_argument("-s", "--shard-size", default=4194304)  # 2^22 is under 4GB
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
 
 
-def exact_shards(dataset: ds.Dataset, size: int) -> Generator[pa.Array, None, None]:
-    counter = 0
-    idxs_batches: list[pa.RecordBatch] = []
-    embeddings_batches: list[pa.RecordBatch] = []
-    for batch in dataset.to_batches():
-        idxs_batches.append(batch["idxs"])
-        embeddings_batches.append(batch["embeddings"])
-        counter += len(batch)
+class VectorConverter:
+    def __init__(self, bf16: bool):
+        self.bf16 = bf16  # else fp16
 
-        while counter >= size:
-            # emit a no-copy concatenation of the chunks
-            idxs_concat = pa.chunked_array(idxs_batches)
-            embeddings_concat = pa.chunked_array(embeddings_batches)
-            yield idxs_concat[:size], embeddings_concat[:size]
-
-            # drop the chunks (eventually), but take a copy of the remainder
-            idxs_batches = [idxs_concat[size:].combine_chunks()]
-            embeddings_batches = [embeddings_concat[size:].combine_chunks()]
-            counter -= size
-
-    if counter:
-        idxs_concat = pa.chunked_array(idxs_batches)
-        embeddings_concat = pa.chunked_array(embeddings_batches)
-        yield idxs_concat, embeddings_concat
+    def from_sql_binary(self, val: bytes) -> npt.NDArray:
+        if self.bf16:  # do bf16 -> fp32 (TODO: do this with pure numpy code?)
+            arr = np.frombuffer(val, dtype=np.uint16)
+            t = torch.tensor(arr.copy())  # PyTorch complains about read-only memory
+            arr = t.view(torch.bfloat16).float().numpy()
+        else:
+            arr = np.frombuffer(val, dtype=np.float16)
+        return arr
 
 
-def write_table(shard: pa.Table, path: str, bf16: bool) -> None:
+def to_arrays(
+    idxs: list[str], embeddings: list[npt.NDArray]
+) -> tuple[pa.Array, pa.Array]:
+    dim = embeddings[0].shape[0]
+    flattened = np.hstack(embeddings)
+    embeddings_arr = pa.FixedSizeListArray.from_arrays(flattened, dim)
+    idxs_arr = pa.array(idxs, pa.string())
+    return idxs_arr, embeddings_arr
+
+
+def exact_shards(
+    dataset: sqlite3.Cursor,
+    size: int
+) -> Generator[tuple[pa.Array, pa.Array], None, None]:
+    idxs_batch: list[str] = []
+    embeddings_batch: list[npt.NDArray] = []
+    for idx, embedding in dataset:
+        idxs_batch.append(idx)
+        embeddings_batch.append(embedding)
+
+        if len(idxs_batch) >= size:
+            yield to_arrays(idxs_batch, embeddings_batch)
+            idxs_batch = []
+            embeddings_batch = []
+
+    if idxs_batch:
+        yield to_arrays(idxs_batch, embeddings_batch)
+
+
+def write_table(shard: pa.Table, path: str | Path, bf16: bool) -> None:
     if bf16:
+        # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
+        # completely zero. Exploit this with byte-stream split and lz4 compression
         pq.write_table(
             shard,
-            path,
+            str(path),
             compression="lz4",
             use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
         )
     else:
-        pq.write_table(shard, path, compression="none")
+        # otherwise, compressing float embeddings isn't worth it
+        pq.write_table(shard, str(path), compression="none")
 
 
 def main():
     args = parse_args()
-    d = ds.dataset(args.source)
-    os.mkdir(args.dest)
-    for id_, (idxs_shard, embd_shard) in enumerate(exact_shards(d, args.shard_size)):
-        shard = pa.table([idxs_shard, embd_shard], names=["idxs", "embeddings"])
-        write_table(shard, f"{args.dest}/data_{id_:03}.parquet", args.bf16)
+
+    dest: Path = args.dest
+    dest.mkdir()
+
+    converter = VectorConverter(args.bf16)
+    sqlite3.register_converter("vector", converter.from_sql_binary)
+    with sqlite3.connect(args.source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+        cursor = conn.execute("SELECT * FROM embeddings")
+        shards = exact_shards(cursor, args.shard_size)
+        for id_, (idxs_shard, embd_shard) in enumerate(shards):
+            shard = pa.table([idxs_shard, embd_shard], names=["idxs", "embeddings"])
+            write_table(shard, dest / f"data_{id_:03}.parquet", args.bf16)
 
 
 if __name__ == "__main__":

@@ -1,66 +1,78 @@
 SHELL := bash  # TODO: lift this requirement?
-MC := mc  # TODO: make aws cli an option?
-GZIP := pigz
 
 WORKING_DIR := splits
 
 CFLAGS := -O2
+BUILDFLAGS :=
+ENCODEFLAGS :=
 TRAINFLAGS := -w $(WORKING_DIR)
-
-# Rules cannot have equal signs in the target, so this is a workaround
-EQ := =
 
 abstracts-index/index: abstracts-embeddings/data
 	conda run -n abstracts-search --live-stream python ./train.py 	\
 	$(TRAINFLAGS) $< $@
 
-abstracts-embeddings/data: works
+abstracts-embeddings/data: update
 	conda run -n abstracts-search --live-stream python ./encode.py 	\
-	$(ENCODEFLAGS) $< $@
-
-# A "one-line" rule for getting a parquet from a remote gz, used in remote_targets.mk
-encode_rule := 								\
-  <TGT> : oa_jsonl; 							\
-  $(MC) cat publics3/openalex/data/$$(subst .parquet,.gz,$$@) | 	\
-  $(GZIP) -d | ./oa_jsonl | 						\
-  conda run -n abstracts-search --live-stream python ./build.py 	\
-  $(BUILDFLAGS) $$@
+	$(ENCODEFLAGS) data.sqlite $@
 
 include remote_targets.mk
+EQ := =
+.PHONY: update
+update: | $(events)
+
+# in theory, wouldn't I need to handle two objects in one line here? I could probably
+# update oa_jsonl to handle that?
+# consider downloading the files via curl instead of aws s3 cp, even if we keep s3 ls?
+EQ := =
+events/updated_date$(EQ)% : oa_jsonl | data.sqlite events
+	d="s3://openalex/data/works/$(subst events/,,$@)"; 			\
+	aws s3 ls --no-sign-request "$$d/" | 					\
+		sed -E "s|.* +(.*)|$$d/\1|" | 					\
+		xargs -I % -- aws s3 cp --no-sign-request % - | 		\
+		gunzip | ./oa_jsonl | 						\
+		conda run -n abstracts-search --live-stream python ./build.py 	\
+		$(BUILDFLAGS) data.sqlite
+	touch $@
 
 oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# mcli alias set publics3 https://s3.amazonaws.com "" ""
-# Creates individual rules for each remote updated=XXXX-XX-XX/part-XXX.gz file and a
-# rule with all the targets as prereqs. Each rule is an instance of encode_rule.
-remote_targets.mk: Makefile  # emits works as a target
-	rm -f remote_targets.mk
-	set -e; 								\
-	parts=$$(mktemp); 							\
-	rule=$$(mktemp); 							\
-	printf "works: " >> $$rule; 						\
-	for p in $$(								\
-		$(MC) ls --recursive publics3/openalex/data/works | 		\
-		sed -e 's/.* \(.*\)/\1/'					\
+data.sqlite:
+	python -m sqlite3 data.sqlite \
+		'CREATE TABLE embeddings(oa_id TEXT PRIMARY KEY, embedding vector)'
+
+events:
+	mkdir events
+
+# consider using curl for the manifest then learning to use a JSON query tool
+# warn if the we're within a day after manifest update or 20 days out, then allow the
+# user to ctrl+C within a short amount of time? Can I get the manifest time form
+# HTTP headers, or will I need to bring in the pull parse pattern after all?
+FORCE:
+remote_targets.mk: FORCE
+	tgts="$$(mktemp)"; 							\
+	echo "events = \\" >> $$tgts; 						\
+	for p in $$( 								\
+		aws s3 ls --no-sign-request "s3://openalex/data/works/" | 	\
+		sed -E "s|.* +(.*)|\1|" 					\
 	); do 									\
-		if [[ $$p == "manifest" ]]; then 				\
+		if [[ "$$p" == "manifest" ]]; then 				\
 			continue; 						\
 		fi; 								\
-		tgt="works/$${p/%.gz/.parquet}"; 				\
-		printf "\$$(subst <TGT>,$$tgt,\$$(encode_rule))\n" >> $$parts; 	\
-		printf "\\\\\n    $$tgt" >> $$rule; 				\
+		echo "events/$${p%/} \\" | sed -e "s/=/\$$\(EQ\)/" >> $$tgts; 	\
 	done; 									\
-	printf "\n" >> $$rule; 							\
-	cat $$rule | sed -e "s/=/\$$\(EQ\)/" > $@; 				\
-	cat $$parts | sed -e "s/=/\$$\(EQ\)/" >> $@
+	cmp -s "$$tgts" $@; 							\
+	if [[ $$? != 0 ]]; then 						\
+		mv $$tgts $@; 							\
+	fi
 
 # TODO: make train.py working directory configurable and remove it in make clean?
 .PHONY: clean
 clean:
-	rm -rf works
+	rm -rf events
 	rm -rf $(WORKING_DIR)
 	rm -rf abstracts-embeddings/data
 	rm -rf abstracts-index/index
+	rm -f data.sqlite
 	rm -f remote_targets.mk
 	rm -f oa_jsonl
