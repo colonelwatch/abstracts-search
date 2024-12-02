@@ -30,7 +30,8 @@ def parse_args() -> Namespace:
     parser = ArgumentParser("encode.py", description="Repartitions the embeddings.")
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
-    parser.add_argument("-s", "--shard-size", default=4194304)  # 2^22 is under 4GB
+    parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
+    parser.add_argument("--row-group-size", default=1048576, type=int)  # 1024 * 1024
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
 
@@ -59,7 +60,7 @@ def to_arrays(
     return idxs_arr, embeddings_arr
 
 
-def exact_shards(
+def to_chunks(
     dataset: sqlite3.Cursor,
     size: int
 ) -> Generator[tuple[pa.Array, pa.Array], None, None]:
@@ -78,19 +79,30 @@ def exact_shards(
         yield to_arrays(idxs_batch, embeddings_batch)
 
 
-def write_table(shard: pa.Table, path: str | Path, bf16: bool) -> None:
+def open_parquet(path: str | Path, dim: int, bf16: bool) -> pq.ParquetWriter:
+    schema = {"idxs": pa.string()}
     if bf16:
         # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
         # completely zero. Exploit this with byte-stream split and lz4 compression
-        pq.write_table(
-            shard,
+        schema["embeddings"] = pa.list_(pa.float32(), dim)
+        writer = pq.ParquetWriter(
             str(path),
+            pa.schema(schema),
             compression="lz4",
             use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
         )
     else:
         # otherwise, compressing float embeddings isn't worth it
-        pq.write_table(shard, str(path), compression="none")
+        schema["embeddings"] = pa.list_(pa.float16(), dim)
+        writer = pq.ParquetWriter(str(path), pa.schema(schema), compression="none")
+    return writer
+
+
+def write_to_parquet(
+    idxs_chunk: pa.Array, embd_chunk: pa.Array, writer: pq.ParquetWriter
+) -> None:
+    batch = pa.table([idxs_chunk, embd_chunk], schema=writer.schema)
+    writer.write_table(batch, row_group_size=len(idxs_chunk))
 
 
 def main():
@@ -99,14 +111,37 @@ def main():
     dest: Path = args.dest
     dest.mkdir()
 
+    # TODO: remove tables on ctrl+C
+    shard_size: int = args.shard_size
     converter = VectorConverter(args.bf16)
     sqlite3.register_converter("vector", converter.from_sql_binary)
     with sqlite3.connect(args.source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
         cursor = conn.execute("SELECT * FROM embeddings")
-        shards = exact_shards(cursor, args.shard_size)
-        for id_, (idxs_shard, embd_shard) in enumerate(shards):
-            shard = pa.table([idxs_shard, embd_shard], names=["idxs", "embeddings"])
-            write_table(shard, dest / f"data_{id_:03}.parquet", args.bf16)
+        chunks = to_chunks(cursor, args.row_group_size)
+
+        embedding = conn.execute("SELECT embedding FROM embeddings").fetchone()[0]
+        dim = embedding.shape[0]
+
+        id_ = 0
+        counter = 0
+        shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, args.bf16)
+        for idxs_chunk, embd_chunk in chunks:
+            counter += len(idxs_chunk)
+
+            while counter >= shard_size:
+                excess = counter - shard_size
+
+                cutoff = len(idxs_chunk) - excess
+                write_to_parquet(idxs_chunk[:cutoff], embd_chunk[:cutoff], shard)
+                idxs_chunk = idxs_chunk[cutoff:]
+                embd_chunk = embd_chunk[cutoff:]
+
+                id_ += 1
+                counter = excess
+                shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, args.bf16)
+
+            if counter:
+                write_to_parquet(idxs_chunk, embd_chunk, shard)
 
 
 if __name__ == "__main__":
