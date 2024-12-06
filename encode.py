@@ -16,7 +16,9 @@
 
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from shutil import rmtree
 import sqlite3
+from sys import stderr
 from typing import Generator
 
 import numpy as np
@@ -105,26 +107,25 @@ def write_to_parquet(
     writer.write_table(batch, row_group_size=len(idxs_chunk))
 
 
-def main():
-    args = parse_args()
-
-    dest: Path = args.dest
-    dest.mkdir()
-
-    # TODO: remove tables on ctrl+C
-    shard_size: int = args.shard_size
-    converter = VectorConverter(args.bf16)
+def dump_database(
+    source: Path,
+    dest: Path,
+    shard_size: int,
+    row_group_size: int,
+    bf16: bool,
+):
+    converter = VectorConverter(bf16)
     sqlite3.register_converter("vector", converter.from_sql_binary)
-    with sqlite3.connect(args.source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+    with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
         cursor = conn.execute("SELECT * FROM embeddings")
-        chunks = to_chunks(cursor, args.row_group_size)
+        chunks = to_chunks(cursor, row_group_size)
 
         embedding = conn.execute("SELECT embedding FROM embeddings").fetchone()[0]
         dim = embedding.shape[0]
 
         id_ = 0
         counter = 0
-        shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, args.bf16)
+        shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
         for idxs_chunk, embd_chunk in chunks:
             counter += len(idxs_chunk)
 
@@ -138,11 +139,35 @@ def main():
 
                 id_ += 1
                 counter = excess
-                shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, args.bf16)
+                shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
 
             if counter:
                 write_to_parquet(idxs_chunk, embd_chunk, shard)
 
 
+def main() -> int:
+    args = parse_args()
+
+    source: Path = args.source
+    if not source.exists():
+        print(f'error: source path "{source}" does not exist', file=stderr)
+        return 1
+
+    dest: Path = args.dest
+    if dest.exists():
+        print(f'error: destination path "{dest}" exists', file=stderr)
+        return 1
+    dest.mkdir()
+
+    try:
+        dump_database(source, dest, args.shard_size, args.row_group_size, args.bf16)
+    except KeyboardInterrupt:
+        rmtree(dest)
+        raise
+
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    ret = main()
+    exit(ret)
