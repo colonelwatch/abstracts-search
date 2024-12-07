@@ -18,6 +18,7 @@ from argparse import ArgumentParser, Namespace
 import json
 import logging
 from pathlib import Path
+from sys import stderr
 from typing import Any, TypedDict
 
 from datasets import Dataset, disable_progress_bars
@@ -275,14 +276,25 @@ def save_optimal_params(path: Path, optimal_params: list[IndexParameters]):
 def main():
     args = parse_args()
 
-    progress: bool = args.progress
-    if not progress:
-        disable_progress_bars()
+    source: Path = args.source
+    if not source.exists():
+        print(f'error: source path "{source}" does not exist', file=stderr)
+        return 1
+
+    dest: Path = args.dest
+    if dest.exists():
+        print(f'error: destination path "{dest}" exists', file=stderr)
+        return 1
+    dest.mkdir()
 
     working_dir: Path = args.working_dir
     working_dir.mkdir(exist_ok=True)
 
-    dataset = load_dataset(args.source)
+    progress: bool = args.progress
+    if not progress:
+        disable_progress_bars()
+
+    dataset = load_dataset(source)
     dataset = add_id_column(dataset)
     truncate: int | None = args.truncate
     if truncate is not None:
@@ -309,9 +321,9 @@ def main():
     index = fill_index(dataset, faiss_index, args.batch_size)
     optimal_params = tune_index(index, ground_truth, args.intersection, progress)
 
-    save_ids(args.dest / "ids.parquet", dataset, args.batch_size)
-    save_optimal_params(args.dest / "params.json", optimal_params)
-    save_index(args.dest / "index.faiss", index)
+    save_ids(dest / "ids.parquet", dataset, args.batch_size)
+    save_optimal_params(dest / "params.json", optimal_params)
+    save_index(dest / "index.faiss", index)
 
 
 if __name__ == "__main__":
