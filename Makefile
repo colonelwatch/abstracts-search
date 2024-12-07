@@ -12,7 +12,7 @@ abstracts-index/index: abstracts-embeddings/data
 	$(TRAINFLAGS) $< $@
 
 abstracts-embeddings/data: update
-	conda run -n abstracts-search --live-stream python ./encode.py 	\
+	conda run -n abstracts-search --live-stream python ./dump.py 	\
 	$(ENCODEFLAGS) data.sqlite $@
 
 include remote_targets.mk

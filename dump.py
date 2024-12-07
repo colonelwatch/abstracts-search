@@ -1,4 +1,4 @@
-# encode.py  TODO: rename to dump.py?
+# dump.py
 
 # Copyright 2024 Kenny Peng
 #
@@ -29,7 +29,7 @@ import torch
 
 
 def parse_args() -> Namespace:
-    parser = ArgumentParser("encode.py", description="Repartitions the embeddings.")
+    parser = ArgumentParser("dump.py", description="Dumps embeddings to parquet files.")
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
     parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
