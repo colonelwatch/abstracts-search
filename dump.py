@@ -157,8 +157,8 @@ def main() -> int:
     if dest.exists():
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
-    dest.mkdir()
 
+    dest.mkdir()
     try:
         dump_database(source, dest, args.shard_size, args.row_group_size, args.bf16)
     except KeyboardInterrupt:

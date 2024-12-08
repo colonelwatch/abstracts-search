@@ -18,6 +18,7 @@ from argparse import ArgumentParser, Namespace
 import json
 import logging
 from pathlib import Path
+from shutil import rmtree
 from sys import stderr
 from typing import Any, TypedDict
 
@@ -285,7 +286,6 @@ def main():
     if dest.exists():
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
-    dest.mkdir()
 
     working_dir: Path = args.working_dir
     working_dir.mkdir(exist_ok=True)
@@ -321,9 +321,14 @@ def main():
     index = fill_index(dataset, faiss_index, args.batch_size)
     optimal_params = tune_index(index, ground_truth, args.intersection, progress)
 
-    save_ids(dest / "ids.parquet", dataset, args.batch_size)
-    save_optimal_params(dest / "params.json", optimal_params)
-    save_index(dest / "index.faiss", index)
+    dest.mkdir()
+    try:
+        save_ids(dest / "ids.parquet", dataset, args.batch_size)
+        save_optimal_params(dest / "params.json", optimal_params)
+        save_index(dest / "index.faiss", index)
+    except KeyboardInterrupt:
+        rmtree(dest)
+        raise
 
 
 if __name__ == "__main__":
