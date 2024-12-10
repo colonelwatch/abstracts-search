@@ -18,13 +18,15 @@ from argparse import ArgumentParser, Namespace
 import json
 import logging
 from pathlib import Path
-from shutil import rmtree
+from shutil import rmtree, move
 from sys import stderr
+from tempfile import TemporaryDirectory
 from typing import Any, TypedDict
 
 from datasets import Dataset, disable_progress_bars
 from datasets.fingerprint import Hasher
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
+from faiss.contrib.ondisk import merge_ondisk
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -53,6 +55,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-P", "--progress", action="store_true")
     parser.add_argument("-t", "--truncate", default=None, type=int)
+    parser.add_argument("--shard-size", default=4194304, type=int)
     return parser.parse_args()
 
 
@@ -73,6 +76,8 @@ def splits(
     test_size: int,
     seed: int = 42
 ) -> tuple[Dataset, Dataset]:
+    # TODO: investigate whether taking queries from the end of the shuffle is
+    # significantly slower than `train_test_split` or not
     splits = dataset.train_test_split(test_size, train_size, seed=seed)
     return splits["train"], splits["test"]  # result: two sets of indices, one file
 
@@ -132,7 +137,6 @@ def make_ground_truth(
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
 
-    queries._indices
     with queries.formatted_as("torch", columns=["embeddings", "ids"]):
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
@@ -157,7 +161,9 @@ def make_ground_truth(
             d_batch = d_batch.cuda(non_blocking=True)
             d_batch_ids = d_batch_ids.cuda(non_blocking=True)
 
-            not_in_queries = torch.isin(d_batch_ids, q_ids, invert=True)
+            not_in_queries = torch.isin(
+                d_batch_ids, q_ids, assume_unique=True, invert=True
+            )
             d_batch = d_batch[not_in_queries]
             d_batch_ids = d_batch_ids[not_in_queries]
 
@@ -219,15 +225,64 @@ def train_index(
 
 
 def fill_index(
-    dataset: Dataset, trained_index: faiss.Index, batch_size: int
+    index_dir: Path,
+    index_filename: str,
+    vectors_filename: str,
+    dataset: Dataset,
+    trained_index: faiss.Index,
+    batch_size: int,
+    shard_size: int,
+    holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
-    # fill the index on the gpu, using the dataset, then restore the dataset's state
-    on_gpu = to_gpu(trained_index)
-    dataset.add_faiss_index(
-        "embeddings", custom_index=on_gpu, batch_size=batch_size
-    )
-    dataset.drop_index("embeddings")
-    return to_cpu(on_gpu)
+    with TemporaryDirectory() as tmpdir:
+        chunk_paths: list[Path] = []
+        on_gpu = to_gpu(trained_index)
+        for i_shard, shard_start in enumerate(range(0, len(dataset), shard_size)):
+            shard = dataset.select(
+                range(shard_start, min(shard_start + shard_size, len(dataset)))
+            )
+
+            for batch_start in range(0, len(shard), batch_size):
+                batch = shard.select(
+                    range(batch_start, min(batch_start + batch_size, len(shard)))
+                )
+                with batch.formatted_as("numpy"):
+                    batch_ids: npt.NDArray = batch["ids"]  # type: ignore
+                    batch_embeddings: npt.NDArray = batch["embeddings"]  # type: ignore
+
+                # TODO: is this slower than precalculating a mask?
+                if holdout_ids is not None:
+                    not_in_test_set = np.isin(
+                        batch_ids, holdout_ids, assume_unique=True, invert=True
+                    )
+                    batch_ids = batch_ids[not_in_test_set]
+                    batch_embeddings = batch_embeddings[not_in_test_set]
+
+                on_gpu.add_with_ids(batch_embeddings, batch_ids)  # type: ignore
+
+            shard_index = to_cpu(on_gpu)
+            path = Path(tmpdir) / f"index_{i_shard:03d}.faiss'"
+            faiss.write_index(shard_index, str(path))
+
+            chunk_paths.append(path)
+            on_gpu.reset()
+
+        # TODO: investigate why I build in current working directory first
+        temp_vectors_path = Path(vectors_filename)
+        vectors_path = index_dir / vectors_filename
+        index_path = index_dir / index_filename
+        try:
+            index = faiss.clone_index(trained_index)
+            merge_ondisk(index, [str(p) for p in chunk_paths], str(temp_vectors_path))
+            move(temp_vectors_path, vectors_path)
+            faiss.write_index(index, str(index_path))
+        except KeyboardInterrupt:
+            temp_vectors_path.unlink(missing_ok=True)
+            vectors_path.unlink(missing_ok=True)
+            index_path.unlink(missing_ok=True)
+            raise
+
+    return index
 
 
 def tune_index(
@@ -263,10 +318,6 @@ def tune_index(
 
 def save_ids(path: Path, dataset: Dataset, batch_size: int):
     dataset.remove_columns("embeddings").to_parquet(path, batch_size, compression="lz4")
-
-
-def save_index(path: Path, index: faiss.Index):
-    faiss.write_index(index, str(path))
 
 
 def save_optimal_params(path: Path, optimal_params: list[IndexParameters]):
@@ -318,14 +369,35 @@ def main():
     train_memmap = create_memmap(working_dir, train, args.batch_size, progress)
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
-    index = fill_index(dataset, faiss_index, args.batch_size)
-    optimal_params = tune_index(index, ground_truth, args.intersection, progress)
+
+    with TemporaryDirectory() as tmpdir:
+        with queries.formatted_as("numpy"):
+            q_ids: npt.NDArray = queries["ids"]  # type: ignore
+        index = fill_index(
+            Path(tmpdir),
+            "index.faiss",
+            "index.ivfdata",
+            dataset,
+            faiss_index,
+            args.batch_size,
+            args.shard_size,
+            holdout_ids=q_ids
+        )
+        optimal_params = tune_index(index, ground_truth, args.intersection, progress)
 
     dest.mkdir()
     try:
         save_ids(dest / "ids.parquet", dataset, args.batch_size)
         save_optimal_params(dest / "params.json", optimal_params)
-        save_index(dest / "index.faiss", index)
+        fill_index(
+            dest,
+            "index.faiss",
+            "index.ivfdata",
+            dataset,
+            faiss_index,
+            args.batch_size,
+            args.shard_size,
+        )
     except KeyboardInterrupt:
         rmtree(dest)
         raise
