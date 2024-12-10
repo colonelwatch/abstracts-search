@@ -36,6 +36,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-t", "--tasks", default=2, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
+    parser.add_argument("--truncate", default=None, type=int)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -109,6 +110,7 @@ def load_oajsonl_batched(
 def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
+    truncate: int | None,
     normalize: bool,
 ) -> torch.Tensor:
     model.eval()
@@ -123,6 +125,9 @@ def encode_faster(
         out_features = model.forward(features)
         embeddings = out_features["sentence_embedding"]
 
+    if truncate is not None:
+        embeddings = embeddings[:, :truncate]
+
     if normalize:
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
@@ -133,6 +138,7 @@ def encode_pipelined(
     batches: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
     n_tasks: int,
+    truncate: int | None,
     normalize: bool,
     progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
@@ -148,9 +154,10 @@ def encode_pipelined(
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_batches.append(idxs_batch)
-            embed_tasks.append(
-                executor.submit(encode_faster, model, documents_batch, normalize)
+            task = executor.submit(
+                encode_faster, model, documents_batch, truncate, normalize
             )
+            embed_tasks.append(task)
 
         # wait for the remaining tasks to finish
         while embed_tasks:
@@ -168,18 +175,27 @@ def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
 def main():
     args = parse_args()
 
+    truncate: int | None = args.truncate
+    normalize: bool = args.normalize
+    if truncate is not None and not normalize:
+        print(
+            "warning: set truncate but not normalize "
+            "(unexpected for matryoshka retrieval)",
+            file=sys.stderr
+        )
+
     # Get model with file lock to ensure next process will see this one
     with FileLock("/tmp/abstracts-search-gpu.lock"):
         model = get_model(args.model_name, args.bf16, args.trust_remote_code)
 
     embedding_dim = model.get_sentence_embedding_dimension()
     if embedding_dim is None:
-        print("model doesn't have exact embedding dim")
-        exit(-1)
+        print("error: model doesn't have exact embedding dim", file=sys.stderr)
+        exit(1)
 
     batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
     batches = encode_pipelined(
-        batches, model, args.tasks, args.normalize, args.progress
+        batches, model, args.tasks, truncate, normalize, args.progress
     )
 
     idxs_batches: list[list[str]] = []
