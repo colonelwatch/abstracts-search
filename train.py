@@ -137,19 +137,16 @@ def make_ground_truth(
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
 
-    with queries.formatted_as("torch", columns=["embeddings", "ids"]):
+    with queries.formatted_as("torch", columns=["embeddings", "ids"], device="cuda"):
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
-    q = q.cuda()
-    q_ids = q_ids.cuda()
-
     n_q, _ = q.shape
     if inner_product:
-        gt_scores = torch.zeros((n_q, k), dtype=torch.float32).cuda()
+        gt_scores = torch.zeros((n_q, k), dtype=torch.float32, device="cuda")
     else:
-        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32).cuda()
-    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32).cuda()
+        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32, device="cuda")
+    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32, device="cuda")
     with (
         dataset.formatted_as("torch", columns=["embeddings", "ids"]),
         tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter,
