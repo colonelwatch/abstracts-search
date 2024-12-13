@@ -37,7 +37,6 @@ def parse_args() -> Namespace:
     parser.add_argument("-t", "--tasks", default=2, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
     parser.add_argument("--truncate", default=None, type=int)
-    parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
@@ -111,7 +110,6 @@ def encode_faster(
     model: SentenceTransformer,
     sentences: list[str],
     truncate: int | None,
-    normalize: bool,
 ) -> torch.Tensor:
     model.eval()
 
@@ -128,9 +126,6 @@ def encode_faster(
     if truncate is not None:
         embeddings = embeddings[:, :truncate]
 
-    if normalize:
-        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-
     return embeddings.cpu()
 
 
@@ -139,7 +134,6 @@ def encode_pipelined(
     model: SentenceTransformer,
     n_tasks: int,
     truncate: int | None,
-    normalize: bool,
     progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
     idxs_batches = deque[list[str]]()
@@ -154,9 +148,7 @@ def encode_pipelined(
 
             # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
             idxs_batches.append(idxs_batch)
-            task = executor.submit(
-                encode_faster, model, documents_batch, truncate, normalize
-            )
+            task = executor.submit(encode_faster, model, documents_batch, truncate)
             embed_tasks.append(task)
 
         # wait for the remaining tasks to finish
@@ -175,14 +167,8 @@ def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
 def main():
     args = parse_args()
 
+    # TODO: move truncate to train.py
     truncate: int | None = args.truncate
-    normalize: bool = args.normalize
-    if truncate is not None and not normalize:
-        print(
-            "warning: set truncate but not normalize "
-            "(unexpected for matryoshka retrieval)",
-            file=sys.stderr
-        )
 
     # Get model with file lock to ensure next process will see this one
     with FileLock("/tmp/abstracts-search-gpu.lock"):
@@ -194,9 +180,7 @@ def main():
         exit(1)
 
     batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
-    batches = encode_pipelined(
-        batches, model, args.tasks, truncate, normalize, args.progress
-    )
+    batches = encode_pipelined(batches, model, args.tasks, truncate, args.progress)
 
     idxs_batches: list[list[str]] = []
     embeddings_batches: list[torch.Tensor] = []

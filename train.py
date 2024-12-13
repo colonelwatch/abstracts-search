@@ -48,6 +48,7 @@ def parse_args() -> Namespace:
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
     parser.add_argument("-w", "--working-dir", default="splits", type=Path)
+    parser.add_argument("-N", "--normalize", action="store_true")
     parser.add_argument("-i", "--inner-product", action="store_true")
     parser.add_argument("-k", "--intersection", default=10, type=int)
     parser.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
@@ -83,7 +84,11 @@ def splits(
 
 
 def create_memmap(
-    working_dir: Path, dataset: Dataset, batch_size: int, progress: bool
+    working_dir: Path,
+    dataset: Dataset,
+    normalize: bool,
+    batch_size: int,
+    progress: bool
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
     d = len(dataset[0]["embeddings"])
@@ -96,15 +101,20 @@ def create_memmap(
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
         with (
-            dataset.formatted_as("numpy", columns=["embeddings"]),
+            dataset.formatted_as("torch", columns=["embeddings"]),
             tqdm(total=len(dataset), disable=(not progress)) as counter
         ):
             i = 0
             for batch in dataset.iter(batch_size):
-                embeddings_batch: npt.NDArray = batch["embeddings"]  # type: ignore
+                embeddings_batch: torch.Tensor = batch["embeddings"]  # type: ignore
                 n_batch = len(embeddings_batch)
 
-                memmap[i:(i + n_batch)] = embeddings_batch
+                embeddings_batch = embeddings_batch.cuda(non_blocking=True)
+
+                if normalize:
+                    embeddings_batch = torch.nn.functional.normalize(embeddings_batch)
+
+                memmap[i:(i + n_batch)] = embeddings_batch.cpu().numpy()
                 i += n_batch
 
                 counter.update(n_batch)
@@ -121,6 +131,7 @@ def make_ground_truth(
     working_dir: Path,
     dataset: Dataset,
     queries: Dataset,
+    normalize: bool,
     batch_size: int,
     k: int,
     inner_product: bool,
@@ -129,6 +140,7 @@ def make_ground_truth(
     h = Hasher()
     h.update(dataset._fingerprint)
     h.update(queries._fingerprint)
+    h.update(normalize)
     h.update(batch_size)
     h.update(k)
     h.update(inner_product)
@@ -141,12 +153,16 @@ def make_ground_truth(
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
+    if normalize:
+        q = torch.nn.functional.normalize(q)
+
     n_q, _ = q.shape
+    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32, device="cuda")
     if inner_product:
         gt_scores = torch.zeros((n_q, k), dtype=torch.float32, device="cuda")
     else:
         gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32, device="cuda")
-    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32, device="cuda")
+
     with (
         dataset.formatted_as("torch", columns=["embeddings", "ids"]),
         tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter,
@@ -163,6 +179,9 @@ def make_ground_truth(
             )
             d_batch = d_batch[not_in_queries]
             d_batch_ids = d_batch_ids[not_in_queries]
+
+            if normalize:
+                d_batch = torch.nn.functional.normalize(d_batch)
 
             if inner_product:
                 scores_batch = q @ d_batch.T
@@ -360,13 +379,16 @@ def main():
         working_dir,
         dataset,
         queries,
+        args.normalize,
         args.batch_size,
         args.intersection,
         args.inner_product,
         progress,
     )
 
-    train_memmap = create_memmap(working_dir, train, args.batch_size, progress)
+    train_memmap = create_memmap(
+        working_dir, train, args.normalize, args.batch_size, progress
+    )
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
