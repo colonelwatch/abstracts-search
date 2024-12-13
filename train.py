@@ -50,7 +50,7 @@ def parse_args() -> Namespace:
     parser.add_argument("-w", "--working-dir", default="splits", type=Path)
     parser.add_argument("-i", "--inner-product", action="store_true")
     parser.add_argument("-k", "--intersection", default=10, type=int)
-    parser.add_argument("-c", "--clusters", default=131072, type=int)  # TODO: raise
+    parser.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
     parser.add_argument("-q", "--queries", default=16384, type=int)
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-P", "--progress", action="store_true")
@@ -351,9 +351,12 @@ def main():
     if truncate is not None:
         dataset = dataset.take(truncate)
 
-    clusters: int = args.clusters
-    factory_string = f"OPQ64_256,IVF{clusters},PQ64"
-    train_size = TRAIN_SIZE_MULTIPLE * clusters
+    n_clusters: int | None = args.clusters
+    n_queries: int = args.queries
+    if n_clusters is None:
+        n_clusters = (len(dataset) - n_queries) // TRAIN_SIZE_MULTIPLE
+    factory_string = f"OPQ64_256,IVF{n_clusters},PQ64"
+    train_size = TRAIN_SIZE_MULTIPLE * n_clusters
 
     train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
