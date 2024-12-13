@@ -48,6 +48,7 @@ def parse_args() -> Namespace:
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
     parser.add_argument("-w", "--working-dir", default="splits", type=Path)
+    parser.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
     parser.add_argument("-N", "--normalize", action="store_true")
     parser.add_argument("-i", "--inner-product", action="store_true")
     parser.add_argument("-k", "--intersection", default=10, type=int)
@@ -86,6 +87,7 @@ def splits(
 def create_memmap(
     working_dir: Path,
     dataset: Dataset,
+    dimensions: int | None,
     normalize: bool,
     batch_size: int,
     progress: bool
@@ -109,10 +111,12 @@ def create_memmap(
                 embeddings_batch: torch.Tensor = batch["embeddings"]  # type: ignore
                 n_batch = len(embeddings_batch)
 
+                if dimensions is not None:
+                    embeddings_batch = embeddings_batch[:, :dimensions]
                 embeddings_batch = embeddings_batch.cuda(non_blocking=True)
-
                 if normalize:
                     embeddings_batch = torch.nn.functional.normalize(embeddings_batch)
+                embeddings_batch = embeddings_batch.cpu()
 
                 memmap[i:(i + n_batch)] = embeddings_batch.cpu().numpy()
                 i += n_batch
@@ -131,6 +135,7 @@ def make_ground_truth(
     working_dir: Path,
     dataset: Dataset,
     queries: Dataset,
+    dimensions: int | None,
     normalize: bool,
     batch_size: int,
     k: int,
@@ -153,6 +158,8 @@ def make_ground_truth(
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
+    if dimensions is not None:
+        q = q[:, :dimensions]
     if normalize:
         q = torch.nn.functional.normalize(q)
 
@@ -180,6 +187,8 @@ def make_ground_truth(
             d_batch = d_batch[not_in_queries]
             d_batch_ids = d_batch_ids[not_in_queries]
 
+            if dimensions is not None:
+                d_batch = d_batch[:, :dimensions]
             if normalize:
                 d_batch = torch.nn.functional.normalize(d_batch)
 
@@ -336,9 +345,19 @@ def save_ids(path: Path, dataset: Dataset, batch_size: int):
     dataset.remove_columns("embeddings").to_parquet(path, batch_size, compression="lz4")
 
 
-def save_optimal_params(path: Path, optimal_params: list[IndexParameters]):
+def save_optimal_params(
+    path: Path,
+    dimensions: int | None,
+    normalize: bool,
+    optimal_params: list[IndexParameters]
+):
+    params = {
+        "dimensions": dimensions,
+        "normalize": normalize,
+        "optimal_params": optimal_params
+    }
     with open(path, "w") as f:
-        json.dump(optimal_params, f, indent=4)
+        json.dump(params, f, indent=4)
 
 
 def main():
@@ -356,6 +375,12 @@ def main():
 
     working_dir: Path = args.working_dir
     working_dir.mkdir(exist_ok=True)
+
+    dimensions: int | None = args.dimensions
+    normalize: bool = args.normalize
+    if args.dimensions is not None and not args.normalize:
+        print("warning: inferring --normalize from --dimension", file=stderr)
+        normalize = True
 
     progress: bool = args.progress
     if not progress:
@@ -379,7 +404,8 @@ def main():
         working_dir,
         dataset,
         queries,
-        args.normalize,
+        dimensions,
+        normalize,
         args.batch_size,
         args.intersection,
         args.inner_product,
@@ -387,7 +413,7 @@ def main():
     )
 
     train_memmap = create_memmap(
-        working_dir, train, args.normalize, args.batch_size, progress
+        working_dir, train, dimensions, normalize, args.batch_size, progress
     )
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
@@ -410,7 +436,7 @@ def main():
     dest.mkdir()
     try:
         save_ids(dest / "ids.parquet", dataset, args.batch_size)
-        save_optimal_params(dest / "params.json", optimal_params)
+        save_optimal_params(dest / "params.json", dimensions, normalize, optimal_params)
         fill_index(
             dest,
             "index.faiss",
