@@ -84,6 +84,13 @@ def splits(
     return splits["train"], splits["test"]  # result: two sets of indices, one file
 
 
+def hash(parameters: list) -> str:
+    h = Hasher()
+    for parameter in parameters:
+        h.update(parameter)
+    return h.hexdigest()
+
+
 def create_memmap(
     working_dir: Path,
     dataset: Dataset,
@@ -93,10 +100,17 @@ def create_memmap(
     progress: bool
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
-    d = len(dataset[0]["embeddings"])
+    d = len(dataset[0]["embeddings"]) if dimensions is None else dimensions
     shape = (n, d)
 
-    cache_path = working_dir / f"train_{dataset._fingerprint}.memmap"
+    cache_identifier = hash(
+        [
+            dataset._fingerprint,
+            dimensions,
+            normalize
+        ]
+    )
+    cache_path = working_dir / f"train_{cache_identifier}.memmap"
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
@@ -142,14 +156,16 @@ def make_ground_truth(
     inner_product: bool,
     progress: bool,
 ) -> Dataset:
-    h = Hasher()
-    h.update(dataset._fingerprint)
-    h.update(queries._fingerprint)
-    h.update(normalize)
-    h.update(batch_size)
-    h.update(k)
-    h.update(inner_product)
-    cache_identifier = h.hexdigest()
+    cache_identifier = hash(
+        [
+            dataset._fingerprint,
+            queries._fingerprint,
+            normalize,
+            batch_size,
+            k,
+            inner_product
+        ]
+    )
     cache_path = working_dir / f"gt_{cache_identifier}"
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
