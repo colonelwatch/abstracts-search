@@ -17,11 +17,12 @@
 from argparse import ArgumentParser, Namespace
 import json
 import logging
+import os
 from pathlib import Path
 from shutil import rmtree, move
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from datasets import Dataset, disable_progress_bars
 from datasets.fingerprint import Hasher
@@ -41,6 +42,17 @@ class IndexParameters(TypedDict):
     recall: float  # in this case 10-recall@10
     exec_time: float  # seconds (raw faiss measure is in milliseconds)
     param_string: str  # pass directly to faiss index
+
+
+def get_env_var[T, U](
+    key: str, type_: Callable[[str], T] = str, default: U = None
+) -> T | U:
+    var = os.getenv(key)
+    if var is not None:
+        var = type_(var)
+    else:
+        var = default
+    return var
 
 
 def parse_args() -> Namespace:
@@ -78,8 +90,6 @@ def splits(
     test_size: int,
     seed: int = 42
 ) -> tuple[Dataset, Dataset]:
-    # TODO: investigate whether taking queries from the end of the shuffle is
-    # significantly slower than `train_test_split` or not
     splits = dataset.train_test_split(test_size, train_size, seed=seed)
     return splits["train"], splits["test"]  # result: two sets of indices, one file
 
@@ -92,7 +102,7 @@ def hash(parameters: list) -> str:
 
 
 def create_memmap(
-    working_dir: Path,
+    cache_dir: Path,
     dataset: Dataset,
     dimensions: int | None,
     normalize: bool,
@@ -110,7 +120,7 @@ def create_memmap(
             normalize
         ]
     )
-    cache_path = working_dir / f"train_{cache_identifier}.memmap"
+    cache_path = cache_dir / f"train_{cache_identifier}.memmap"
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
@@ -147,7 +157,7 @@ def create_memmap(
 # TODO: multithread?
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
-    working_dir: Path,
+    cache_dir: Path,
     dataset: Dataset,
     queries: Dataset,
     normalize: bool,
@@ -166,7 +176,7 @@ def make_ground_truth(
             inner_product
         ]
     )
-    cache_path = working_dir / f"gt_{cache_identifier}"
+    cache_path = cache_dir / f"gt_{cache_identifier}"
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
 
@@ -271,11 +281,12 @@ def fill_index(
     trained_index: faiss.Index,
     batch_size: int,
     shard_size: int,
+    cache_dir: Path,
     holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
     holdout_ids_tensor = None if holdout_ids is None else torch.from_numpy(holdout_ids)
 
-    with TemporaryDirectory() as tmpdir:
+    with TemporaryDirectory(dir=cache_dir) as tmpdir:
         chunk_paths: list[Path] = []
         on_gpu = to_gpu(trained_index)
         for i_shard, shard_start in enumerate(range(0, len(dataset), shard_size)):
@@ -394,6 +405,9 @@ def save_optimal_params(
 
 
 def main():
+    cache_dir = get_env_var(
+        "ABSTRACTS_INDEX_CACHE", Path, Path.home() / ".cache/abstracts-index"
+    )
     args = parse_args()
 
     source: Path = args.source
@@ -406,8 +420,7 @@ def main():
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
 
-    working_dir: Path = args.working_dir
-    working_dir.mkdir(exist_ok=True)
+    cache_dir.mkdir(exist_ok=True)
 
     dimensions: int | None = args.dimensions
     normalize: bool = args.normalize
@@ -434,7 +447,7 @@ def main():
 
     train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
-        working_dir,
+        cache_dir,
         dataset,
         queries,
         normalize,
@@ -445,12 +458,12 @@ def main():
     )
 
     train_memmap = create_memmap(
-        working_dir, train, dimensions, normalize, args.batch_size, progress
+        cache_dir, train, dimensions, normalize, args.batch_size, progress
     )
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
-    with TemporaryDirectory() as tmpdir:
+    with TemporaryDirectory(dir=cache_dir) as tmpdir:
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["ids"]  # type: ignore
         index = fill_index(
@@ -463,6 +476,7 @@ def main():
             faiss_index,
             args.batch_size,
             args.shard_size,
+            cache_dir,
             holdout_ids=q_ids
         )
         optimal_params = tune_index(
@@ -483,6 +497,7 @@ def main():
             faiss_index,
             args.batch_size,
             args.shard_size,
+            cache_dir
         )
     except KeyboardInterrupt:
         rmtree(dest)
