@@ -145,11 +145,11 @@ def create_memmap(
 
 
 # TODO: multithread?
+# NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
     working_dir: Path,
     dataset: Dataset,
     queries: Dataset,
-    dimensions: int | None,
     normalize: bool,
     batch_size: int,
     k: int,
@@ -174,8 +174,6 @@ def make_ground_truth(
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
-    if dimensions is not None:
-        q = q[:, :dimensions]
     if normalize:
         q = torch.nn.functional.normalize(q)
 
@@ -203,8 +201,6 @@ def make_ground_truth(
             d_batch = d_batch[not_in_queries]
             d_batch_ids = d_batch_ids[not_in_queries]
 
-            if dimensions is not None:
-                d_batch = d_batch[:, :dimensions]
             if normalize:
                 d_batch = torch.nn.functional.normalize(d_batch)
 
