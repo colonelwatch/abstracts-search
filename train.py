@@ -24,7 +24,8 @@ from sys import stderr
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, TypedDict
 
-from datasets import Dataset, disable_progress_bars
+from datasets import Dataset, disable_progress_bars, disable_caching
+from datasets.config import HF_DATASETS_CACHE
 from datasets.fingerprint import Hasher
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
 from faiss.contrib.ondisk import merge_ondisk
@@ -59,7 +60,8 @@ def parse_args() -> Namespace:
     parser = ArgumentParser("train.py", "Trains the FAISS index.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    _ = subparsers.add_parser("clean")
+    clean = subparsers.add_parser("clean")
+    clean.add_argument("-s", "--source", default=None, type=Path)
 
     train = subparsers.add_parser("train")
     train.add_argument("source", type=Path)
@@ -74,6 +76,7 @@ def parse_args() -> Namespace:
     train.add_argument("-P", "--progress", action="store_true")
     train.add_argument("-t", "--truncate", default=None, type=int)
     train.add_argument("--shard-size", default=4194304, type=int)
+    train.add_argument("--use-cache", action="store_true")
 
     return parser.parse_args()
 
@@ -420,7 +423,41 @@ def main():
     if args.mode == "clean":
         if cache_dir.exists():
             rmtree(cache_dir)
+
+        # get cache directory path by following the path to an individual cache file
+        # NOTE: if the cache wasn't created, this will create then delete the cache
+        clean_source: Path | None = args.source
+        if clean_source is not None and clean_source.exists():
+            dataset = load_dataset(clean_source)
+            file_0_path = Path(dataset.cache_files[0]["filename"])
+            del dataset
+
+            # parts[0] -> dataset ("parquet" by default)
+            # parts[1] -> cache (pseudorandom, seeded with stuff like file metadata)
+            # since this is a low-level detail, sanity-check the above facts for change
+            file_0_path_rel = file_0_path.relative_to(HF_DATASETS_CACHE)
+            dataset_name = file_0_path_rel.parts[0]
+            cache_name = file_0_path_rel.parts[1]
+            if not (
+                dataset_name == "parquet"
+                and "default-" in cache_name
+            ):
+                print("error: path integrity check failed", file=stderr)
+                return 1
+
+            # remove the cache directory
+            hf_cache_dir = HF_DATASETS_CACHE / dataset_name / cache_name
+            rmtree(hf_cache_dir)
+
+            # remove its associated lock
+            for lock in HF_DATASETS_CACHE.iterdir():
+                if not lock.suffix == ".lock":
+                    continue
+                if cache_name in str(lock):
+                    lock.unlink()
+
         return 0
+
     cache_dir.mkdir(exist_ok=True)
 
     source: Path = args.source
@@ -439,7 +476,11 @@ def main():
         print("warning: inferring --normalize from --dimension", file=stderr)
         normalize = True
 
+    # run through global huggingface datasets settings
+    use_cache: bool = args.use_cache
     progress: bool = args.progress
+    if not use_cache:
+        disable_caching()  # caching is good for experimention, not otherwise
     if not progress:
         disable_progress_bars()
 
