@@ -266,11 +266,15 @@ def fill_index(
     index_filename: str,
     vectors_filename: str,
     dataset: Dataset,
+    dimensions: int | None,
+    normalize: bool,
     trained_index: faiss.Index,
     batch_size: int,
     shard_size: int,
     holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
+    holdout_ids_tensor = None if holdout_ids is None else torch.from_numpy(holdout_ids)
+
     with TemporaryDirectory() as tmpdir:
         chunk_paths: list[Path] = []
         on_gpu = to_gpu(trained_index)
@@ -283,19 +287,26 @@ def fill_index(
                 batch = shard.select(
                     range(batch_start, min(batch_start + batch_size, len(shard)))
                 )
-                with batch.formatted_as("numpy"):
-                    batch_ids: npt.NDArray = batch["ids"]  # type: ignore
-                    batch_embeddings: npt.NDArray = batch["embeddings"]  # type: ignore
+                with batch.formatted_as("torch"):
+                    batch_ids: torch.Tensor = batch["ids"]  # type: ignore
+                    batch_embeddings: torch.Tensor = batch["embeddings"]  # type: ignore
 
                 # TODO: is this slower than precalculating a mask?
-                if holdout_ids is not None:
-                    not_in_test_set = np.isin(
-                        batch_ids, holdout_ids, assume_unique=True, invert=True
+                if holdout_ids_tensor is not None:
+                    not_in_test_set = torch.isin(
+                        batch_ids, holdout_ids_tensor, assume_unique=True, invert=True
                     )
                     batch_ids = batch_ids[not_in_test_set]
                     batch_embeddings = batch_embeddings[not_in_test_set]
 
-                on_gpu.add_with_ids(batch_embeddings, batch_ids)  # type: ignore
+                if dimensions is not None:
+                    batch_embeddings = batch_embeddings[:, :dimensions]
+                batch_embeddings = batch_embeddings.cuda(non_blocking=True)
+                if normalize:
+                    batch_embeddings = torch.nn.functional.normalize(batch_embeddings)
+                batch_embeddings = batch_embeddings.cpu()
+
+                on_gpu.add_with_ids(batch_embeddings.numpy(), batch_ids)  # type: ignore
 
             shard_index = to_cpu(on_gpu)
             path = Path(tmpdir) / f"index_{i_shard:03d}.faiss'"
@@ -323,11 +334,21 @@ def fill_index(
 
 
 def tune_index(
-    filled_index: faiss.Index, ground_truth: Dataset, k: int, progress: bool
+    filled_index: faiss.Index,
+    ground_truth: Dataset,
+    dimensions: int | None,
+    normalize: bool,
+    k: int,
+    progress: bool
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
         q: npt.NDArray[np.float32] = ground_truth["embeddings"]  # type: ignore
         gt_ids: npt.NDArray[np.int64] = ground_truth["gt_ids"]  # type: ignore
+
+    if dimensions is not None:
+        q = q[:, :dimensions]
+    if normalize:
+        q = q / np.linalg.norm(q, ord=2, axis=1)[:, np.newaxis]
 
     # init with ground-truth IDs but not ground-truth distances because faiss doesn't
     # use them anyway (see faiss/AutoTune.cpp)
@@ -416,7 +437,6 @@ def main():
         working_dir,
         dataset,
         queries,
-        dimensions,
         normalize,
         args.batch_size,
         args.intersection,
@@ -438,12 +458,16 @@ def main():
             "index.faiss",
             "index.ivfdata",
             dataset,
+            dimensions,
+            normalize,
             faiss_index,
             args.batch_size,
             args.shard_size,
             holdout_ids=q_ids
         )
-        optimal_params = tune_index(index, ground_truth, args.intersection, progress)
+        optimal_params = tune_index(
+            index, ground_truth, dimensions, normalize, args.intersection, progress
+        )
 
     dest.mkdir()
     try:
@@ -454,6 +478,8 @@ def main():
             "index.faiss",
             "index.ivfdata",
             dataset,
+            dimensions,
+            normalize,
             faiss_index,
             args.batch_size,
             args.shard_size,
