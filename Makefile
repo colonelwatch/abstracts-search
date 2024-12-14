@@ -9,7 +9,7 @@ TRAINFLAGS := -w $(WORKING_DIR)
 
 abstracts-index/index: abstracts-embeddings/data
 	conda run -n abstracts-search --live-stream python ./train.py 	\
-	$(TRAINFLAGS) $< $@
+	train $(TRAINFLAGS) $< $@
 
 abstracts-embeddings/data: update
 	conda run -n abstracts-search --live-stream python ./dump.py 	\
@@ -66,11 +66,10 @@ remote_targets.mk: FORCE
 		mv $$tgts $@; 							\
 	fi
 
-# TODO: make train.py working directory configurable and remove it in make clean?
 .PHONY: clean
 clean:
+	conda run -n abstracts-search --live-stream python train.py clean
 	rm -rf events
-	rm -rf $(WORKING_DIR)
 	rm -rf abstracts-embeddings/data
 	rm -rf abstracts-index/index
 	rm -f data.sqlite

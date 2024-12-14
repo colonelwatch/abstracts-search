@@ -57,19 +57,24 @@ def get_env_var[T, U](
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("train.py", "Trains the FAISS index.")
-    parser.add_argument("source", type=Path)
-    parser.add_argument("dest", type=Path)
-    parser.add_argument("-w", "--working-dir", default="splits", type=Path)
-    parser.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
-    parser.add_argument("-N", "--normalize", action="store_true")
-    parser.add_argument("-i", "--inner-product", action="store_true")
-    parser.add_argument("-k", "--intersection", default=10, type=int)
-    parser.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
-    parser.add_argument("-q", "--queries", default=16384, type=int)
-    parser.add_argument("-b", "--batch-size", default=1024, type=int)
-    parser.add_argument("-P", "--progress", action="store_true")
-    parser.add_argument("-t", "--truncate", default=None, type=int)
-    parser.add_argument("--shard-size", default=4194304, type=int)
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    _ = subparsers.add_parser("clean")
+
+    train = subparsers.add_parser("train")
+    train.add_argument("source", type=Path)
+    train.add_argument("dest", type=Path)
+    train.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
+    train.add_argument("-N", "--normalize", action="store_true")
+    train.add_argument("-i", "--inner-product", action="store_true")
+    train.add_argument("-k", "--intersection", default=10, type=int)
+    train.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
+    train.add_argument("-q", "--queries", default=16384, type=int)
+    train.add_argument("-b", "--batch-size", default=1024, type=int)
+    train.add_argument("-P", "--progress", action="store_true")
+    train.add_argument("-t", "--truncate", default=None, type=int)
+    train.add_argument("--shard-size", default=4194304, type=int)
+
     return parser.parse_args()
 
 
@@ -271,6 +276,7 @@ def train_index(
     return index
 
 
+# TODO: add progress bar
 def fill_index(
     index_dir: Path,
     index_filename: str,
@@ -363,7 +369,8 @@ def tune_index(
 
     # init with ground-truth IDs but not ground-truth distances because faiss doesn't
     # use them anyway (see faiss/AutoTune.cpp)
-    criterion = faiss.IntersectionCriterion(len(ground_truth), k)
+    # criterion = faiss.IntersectionCriterion(len(ground_truth), k)
+    criterion = faiss.OneRecallAtRCriterion(len(ground_truth), 1)
     criterion.set_groundtruth(None, gt_ids)  # type: ignore (monkey-patched)
 
     params = faiss.ParameterSpace()
@@ -410,6 +417,12 @@ def main():
     )
     args = parse_args()
 
+    if args.mode == "clean":
+        if cache_dir.exists():
+            rmtree(cache_dir)
+        return 0
+    cache_dir.mkdir(exist_ok=True)
+
     source: Path = args.source
     if not source.exists():
         print(f'error: source path "{source}" does not exist', file=stderr)
@@ -419,8 +432,6 @@ def main():
     if dest.exists():
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
-
-    cache_dir.mkdir(exist_ok=True)
 
     dimensions: int | None = args.dimensions
     normalize: bool = args.normalize
@@ -442,7 +453,7 @@ def main():
     n_queries: int = args.queries
     if n_clusters is None:
         n_clusters = (len(dataset) - n_queries) // TRAIN_SIZE_MULTIPLE
-    factory_string = f"OPQ64_256,IVF{n_clusters},PQ64"
+    factory_string = f"OPQ96,IVF{n_clusters},PQ96"
     train_size = TRAIN_SIZE_MULTIPLE * n_clusters
 
     train, queries = splits(dataset, train_size, args.queries)
