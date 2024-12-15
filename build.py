@@ -169,11 +169,7 @@ def main():
     batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
     batches = encode_pipelined(batches, model, args.tasks, args.progress)
 
-    idxs_batches: list[list[str]] = []
-    embeddings_batches: list[torch.Tensor] = []
-    for idxs_batch, embeddings_batch in batches:
-        idxs_batches.append(idxs_batch)
-        embeddings_batches.append(embeddings_batch)
+    batches = list(batches)  # collect now to commit them all at once
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with sqlite3.connect(
@@ -181,7 +177,7 @@ def main():
         isolation_level="EXCLUSIVE",
         autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
     ) as conn:
-        for idxs_batch, embeddings_batch in zip(idxs_batches, embeddings_batches):
+        for idxs_batch, embeddings_batch in batches:
             insert_embeddings(idxs_batch, embeddings_batch, conn)
 
 
