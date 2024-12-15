@@ -416,7 +416,7 @@ def save_optimal_params(
 
 def main():
     cache_dir = get_env_var(
-        "ABSTRACTS_INDEX_CACHE", Path, Path.home() / ".cache/abstracts-index"
+        "ABSTRACTS_SEARCH_CACHE", Path, Path.home() / ".cache/abstracts-search"
     )
     args = parse_args()
 
