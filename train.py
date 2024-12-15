@@ -154,7 +154,7 @@ def create_memmap(
                 i += n_batch
 
                 counter.update(n_batch)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Exception):
         cache_path.unlink()
         raise
 
@@ -344,7 +344,7 @@ def fill_index(
             merge_ondisk(index, [str(p) for p in chunk_paths], str(temp_vectors_path))
             move(temp_vectors_path, vectors_path)
             faiss.write_index(index, str(index_path))
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, Exception):
             temp_vectors_path.unlink(missing_ok=True)
             vectors_path.unlink(missing_ok=True)
             index_path.unlink(missing_ok=True)
@@ -551,7 +551,7 @@ def main():
             args.shard_size,
             cache_dir
         )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Exception):
         rmtree(dest)
         raise
 

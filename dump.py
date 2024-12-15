@@ -24,6 +24,7 @@ from typing import Generator
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
@@ -32,6 +33,7 @@ def parse_args() -> Namespace:
     parser = ArgumentParser("dump.py", description="Dumps embeddings to parquet files.")
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
+    parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
     parser.add_argument("--row-group-size", default=1048576, type=int)  # 1024 * 1024
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
@@ -50,6 +52,13 @@ class VectorConverter:
         else:
             arr = np.frombuffer(val, dtype=np.float16)
         return arr
+
+
+# NOTE: copied from build.py
+def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
+    if vect.dtype == torch.bfloat16:
+        vect = vect.view(torch.uint16)
+    return vect.numpy().data
 
 
 def to_arrays(
@@ -114,6 +123,9 @@ def dump_database(
     row_group_size: int,
     bf16: bool,
 ):
+    if not (source.suffix == ".sqlite" and dest.suffix == ""):
+        raise ValueError("invalid source and dest types")
+
     converter = VectorConverter(bf16)
     sqlite3.register_converter("vector", converter.from_sql_binary)
     with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
@@ -145,6 +157,42 @@ def dump_database(
                 write_to_parquet(idxs_chunk, embd_chunk, shard)
 
 
+def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
+    if not (source.suffix == "" and dest.suffix == ".sqlite"):
+        raise ValueError("invalid source and dest types")
+
+    paths = [str(path) for path in source.glob("*.parquet")]
+    dataset: ds.Dataset = ds.dataset(paths)
+
+    embeddings_col_type = dataset.schema.field("embeddings").type
+    length = embeddings_col_type.list_size  # poorly documented!
+    dtype = embeddings_col_type.value_type
+    if dtype == pa.float32():
+        bf16 = True
+    elif dtype == pa.float16():
+        bf16 = False
+    else:
+        raise ValueError(f'invalid embeddings type "{dtype}"')
+
+    sqlite3.register_adapter(torch.Tensor, to_sql_binary)
+    with sqlite3.connect(dest) as conn:
+        conn.execute(  # TODO: copied from Makefile
+            "CREATE TABLE embeddings(oa_id TEXT PRIMARY KEY, embedding vector)"
+        )
+        for batch in dataset.to_batches(batch_size=batch_size):
+            embeddings_np: npt.NDArray = (
+                batch["embeddings"].flatten().to_numpy().reshape((-1, length))
+            )
+            embeddings = torch.from_numpy(embeddings_np.copy())  # no read-only memory
+            if bf16:
+                embeddings = embeddings.bfloat16()
+            conn.executemany(
+                "INSERT INTO embeddings VALUES(?, ?) "
+                "ON CONFLICT(oa_id) DO UPDATE SET embedding=excluded.embedding",
+                zip(batch["idxs"].to_pylist(), embeddings)
+            )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -158,12 +206,22 @@ def main() -> int:
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
 
-    dest.mkdir()
-    try:
-        dump_database(source, dest, args.shard_size, args.row_group_size, args.bf16)
-    except KeyboardInterrupt:
-        rmtree(dest)
-        raise
+    if source.suffix == ".sqlite" and dest.suffix == "":
+        dest.mkdir()
+        try:
+            dump_database(source, dest, args.shard_size, args.row_group_size, args.bf16)
+        except (KeyboardInterrupt, Exception):
+            rmtree(dest)
+            raise
+    elif source.suffix == "" and dest.suffix == ".sqlite":
+        try:
+            dump_dataset(source, dest, args.batch_size)
+        except (KeyboardInterrupt, Exception):
+            dest.unlink()
+            raise
+    else:
+        print("error: invalid source and destination types", file=stderr)
+        return 1
 
     return 0
 
