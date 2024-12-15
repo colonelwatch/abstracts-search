@@ -89,19 +89,12 @@ def parse_args() -> Namespace:
 def load_dataset(dir: Path) -> Dataset:
     paths = [str(path) for path in dir.glob("*.parquet")]
     dataset: Dataset = Dataset.from_parquet(paths)  # type: ignore
-    return dataset
-
-
-def add_id_column(dataset: Dataset) -> Dataset:
     ids = np.arange(len(dataset), dtype=np.int32)
     return dataset.add_column("ids", ids)  # type: ignore (new_fingerprint not required)
 
 
 def splits(
-    dataset: Dataset,
-    train_size: int,
-    test_size: int,
-    seed: int = 42
+    dataset: Dataset, train_size: int, test_size: int, seed: int = 42
 ) -> tuple[Dataset, Dataset]:
     splits = dataset.train_test_split(test_size, train_size, seed=seed)
     return splits["train"], splits["test"]  # result: two sets of indices, one file
@@ -142,10 +135,10 @@ def iter_tensors(  # noqa: E302
 
 
 def create_memmap(
-    cache_dir: Path,
     dataset: Dataset,
     dimensions: int | None,
     normalize: bool,
+    cache_dir: Path,
     batch_size: int,
     n_tasks: int,
     progress: bool
@@ -189,13 +182,13 @@ def create_memmap(
 
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
-    cache_dir: Path,
     dataset: Dataset,
     queries: Dataset,
     normalize: bool,
     batch_size: int,
     k: int | None,
     inner_product: bool,
+    cache_dir: Path,
     n_tasks: int,
     progress: bool,
 ) -> Dataset:
@@ -333,29 +326,28 @@ def train_index(
 
 
 def fill_index(
-    index_dir: Path,
-    index_filename: str,
-    vectors_filename: str,
+    index_path: Path,
+    ivf_path: Path,
+    trained_index: faiss.Index,
     dataset: Dataset,
+    holdout_ids: npt.NDArray | None,
     dimensions: int | None,
     normalize: bool,
-    trained_index: faiss.Index,
+    cache_dir: Path,
     batch_size: int,
     shard_size: int,
-    cache_dir: Path,
     n_tasks: int,
     progress: bool,
-    holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
     if holdout_ids is not None:
-        holdouts = torch.from_numpy(holdout_ids)
-        holdouts_copy = [
-            holdouts.to(f"cuda:{i}")
+        holdouts_cpu = torch.from_numpy(holdout_ids)
+        holdouts = [
+            holdouts_cpu.to(f"cuda:{i}")
             for i in range(torch.cuda.device_count())
         ]
         n_dataset = len(dataset) - len(holdout_ids)
     else:
-        holdouts_copy = None
+        holdouts = None
         n_dataset = len(dataset)
 
     def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
@@ -369,9 +361,9 @@ def fill_index(
         x = x.to(device, non_blocking=True)
         if normalize:
             x = torch.nn.functional.normalize(x)
-        if holdouts_copy is not None:
+        if holdouts is not None:
             ids = ids.to(device, non_blocking=True)
-            not_in = torch.isin(ids, holdouts_copy[device.index], invert=True)
+            not_in = torch.isin(ids, holdouts[device.index], invert=True)
             ids = ids[not_in]
             x = x[not_in]
         return ids.cpu(), x.cpu()
@@ -409,17 +401,15 @@ def fill_index(
             faiss.write_index(shard_index, str(path))
             shard_paths.append(path)
 
-        temp_vectors_path = Path(vectors_filename)
-        vectors_path = index_dir / vectors_filename
-        index_path = index_dir / index_filename
+        temp_ivf_path = Path(ivf_path.name)
         try:
             index = faiss.clone_index(trained_index)
-            merge_ondisk(index, [str(p) for p in shard_paths], str(temp_vectors_path))
-            move(temp_vectors_path, vectors_path)
+            merge_ondisk(index, [str(p) for p in shard_paths], str(temp_ivf_path))
+            move(temp_ivf_path, ivf_path)
             faiss.write_index(index, str(index_path))
         except (KeyboardInterrupt, Exception):
-            temp_vectors_path.unlink(missing_ok=True)
-            vectors_path.unlink(missing_ok=True)
+            temp_ivf_path.unlink(missing_ok=True)
+            ivf_path.unlink(missing_ok=True)
             index_path.unlink(missing_ok=True)
             raise
 
@@ -564,7 +554,6 @@ def main():
         n_tasks = torch.cuda.device_count() + 2
 
     dataset = load_dataset(source)
-    dataset = add_id_column(dataset)
     truncate: int | None = args.truncate
     if truncate is not None:
         dataset = dataset.take(truncate)
@@ -578,19 +567,19 @@ def main():
 
     train, queries = splits(dataset, train_size, args.queries)
     ground_truth = make_ground_truth(
-        cache_dir,
         dataset,
         queries,
         normalize,
         args.batch_size,
         args.intersection,
         args.inner_product,
+        cache_dir,
         n_tasks,
         progress,
     )
 
     train_memmap = create_memmap(
-        cache_dir, train, dimensions, normalize, args.batch_size, n_tasks, progress
+        train, dimensions, normalize, cache_dir, args.batch_size, n_tasks, progress
     )
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
@@ -599,19 +588,18 @@ def main():
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["ids"]  # type: ignore
         index = fill_index(
-            Path(tmpdir),
-            "index.faiss",
-            "index.ivfdata",
+            Path(tmpdir) / "index.faiss",
+            Path(tmpdir) / "index.ivfdata",
+            faiss_index,
             dataset,
+            q_ids,
             dimensions,
             normalize,
-            faiss_index,
+            cache_dir,
             args.batch_size,
             args.shard_size,
-            cache_dir,
             n_tasks,
             progress,
-            holdout_ids=q_ids
         )
         optimal_params = tune_index(
             index, ground_truth, dimensions, normalize, args.intersection, progress
@@ -622,16 +610,16 @@ def main():
         save_ids(dest / "ids.parquet", dataset, args.batch_size)
         save_optimal_params(dest / "params.json", dimensions, normalize, optimal_params)
         fill_index(
-            dest,
-            "index.faiss",
-            "index.ivfdata",
+            dest / "index.faiss",
+            dest / "index.ivfdata",
+            faiss_index,
             dataset,
+            None,
             dimensions,
             normalize,
-            faiss_index,
+            cache_dir,
             args.batch_size,
             args.shard_size,
-            cache_dir,
             n_tasks,
             progress,
         )
