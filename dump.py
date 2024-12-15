@@ -28,6 +28,10 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
+from utils.table_utils import (
+    create_embeddings_table, insert_embeddings, to_sql_binary, VectorConverter
+)
+
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("dump.py", description="Dumps embeddings to parquet files.")
@@ -38,27 +42,6 @@ def parse_args() -> Namespace:
     parser.add_argument("--row-group-size", default=1048576, type=int)  # 1024 * 1024
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
-
-
-class VectorConverter:
-    def __init__(self, bf16: bool):
-        self.bf16 = bf16  # else fp16
-
-    def from_sql_binary(self, val: bytes) -> npt.NDArray:
-        if self.bf16:  # do bf16 -> fp32 (TODO: do this with pure numpy code?)
-            arr = np.frombuffer(val, dtype=np.uint16)
-            t = torch.tensor(arr.copy())  # PyTorch complains about read-only memory
-            arr = t.view(torch.bfloat16).float().numpy()
-        else:
-            arr = np.frombuffer(val, dtype=np.float16)
-        return arr
-
-
-# NOTE: copied from build.py
-def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
-    if vect.dtype == torch.bfloat16:
-        vect = vect.view(torch.uint16)
-    return vect.numpy().data
 
 
 def to_arrays(
@@ -176,9 +159,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with sqlite3.connect(dest) as conn:
-        conn.execute(  # TODO: copied from Makefile
-            "CREATE TABLE embeddings(oa_id TEXT PRIMARY KEY, embedding vector)"
-        )
+        create_embeddings_table(conn)
         for batch in dataset.to_batches(batch_size=batch_size):
             embeddings_np: npt.NDArray = (
                 batch["embeddings"].flatten().to_numpy().reshape((-1, length))
@@ -186,11 +167,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
             embeddings = torch.from_numpy(embeddings_np.copy())  # no read-only memory
             if bf16:
                 embeddings = embeddings.bfloat16()
-            conn.executemany(
-                "INSERT INTO embeddings VALUES(?, ?) "
-                "ON CONFLICT(oa_id) DO UPDATE SET embedding=excluded.embedding",
-                zip(batch["idxs"].to_pylist(), embeddings)
-            )
+            insert_embeddings(batch["idxs"].to_pylist(), embeddings, conn)
 
 
 def main() -> int:

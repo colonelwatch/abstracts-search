@@ -1,4 +1,5 @@
 SHELL := bash  # TODO: lift this requirement?
+PYTHON := conda run -n abstracts-search --live-stream python
 
 WORKING_DIR := splits
 
@@ -8,12 +9,10 @@ ENCODEFLAGS :=
 TRAINFLAGS := -w $(WORKING_DIR)
 
 abstracts-index/index: abstracts-embeddings/data
-	conda run -n abstracts-search --live-stream python ./train.py 	\
-	train $(TRAINFLAGS) $< $@
+	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
 
 abstracts-embeddings/data: update
-	conda run -n abstracts-search --live-stream python ./dump.py 	\
-	$(ENCODEFLAGS) data.sqlite $@
+	$(PYTHON) ./dump.py $(ENCODEFLAGS) data.sqlite $@
 
 include remote_targets.mk
 EQ := =
@@ -30,16 +29,14 @@ events/updated_date$(EQ)% : oa_jsonl | data.sqlite events
 		sed -E "s|.* +(.*)|$$d/\1|" | 					\
 		xargs -I % -- aws s3 cp --no-sign-request % - | 		\
 		gunzip | ./oa_jsonl | 						\
-		conda run -n abstracts-search --live-stream python ./build.py 	\
-		$(BUILDFLAGS) data.sqlite
+		$(PYTHON) ./build.py $(BUILDFLAGS) data.sqlite
 	touch $@
 
 oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 data.sqlite:
-	python -m sqlite3 data.sqlite \
-		'CREATE TABLE embeddings(oa_id TEXT PRIMARY KEY, embedding vector)'
+	$(PYTHON) -m utils.table_utils $@
 
 events:
 	mkdir events

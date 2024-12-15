@@ -29,6 +29,8 @@ from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
 
+from utils.table_utils import insert_embeddings, to_sql_binary
+
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
@@ -152,12 +154,6 @@ def encode_pipelined(
             yield idxs_batches.popleft(), embeddings_batch
 
 
-def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
-    if vect.dtype == torch.bfloat16:
-        vect = vect.view(torch.uint16)
-    return vect.numpy().data
-
-
 def main():
     args = parse_args()
 
@@ -186,15 +182,7 @@ def main():
         autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
     ) as conn:
         for idxs_batch, embeddings_batch in zip(idxs_batches, embeddings_batches):
-            tups = [
-                (idx, embedding) for idx, embedding
-                in zip(idxs_batch, embeddings_batch)
-            ]
-            conn.executemany(
-                "INSERT INTO embeddings VALUES(?, ?) "
-                "ON CONFLICT(oa_id) DO UPDATE SET embedding=excluded.embedding",
-                tups
-            )
+            insert_embeddings(idxs_batch, embeddings_batch, conn)
 
 
 if __name__ == "__main__":
