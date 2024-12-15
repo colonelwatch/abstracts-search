@@ -15,8 +15,6 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, Future
 import json
 from pathlib import Path
 import sys
@@ -29,6 +27,7 @@ from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
 
+from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
 
@@ -132,26 +131,16 @@ def encode_pipelined(
     n_tasks: int,
     progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
-    idxs_batches = deque[list[str]]()
-    embed_tasks = deque[Future[torch.Tensor]]()
-    with ThreadPoolExecutor(n_tasks) as executor, tqdm(disable=(not progress)) as count:
-        for idxs_batch, documents_batch in batches:
-            # clear out the task queue of completed tasks, then wait until there's room
-            while (embed_tasks and embed_tasks[0].done()) or len(embed_tasks) > n_tasks:
-                embeddings_batch = embed_tasks.popleft().result()
-                count.update(len(embeddings_batch))
-                yield idxs_batches.popleft(), embeddings_batch
-
-            # encode in a task so cpu-to-gpu and gpu-to-cpu transfers are both async
-            idxs_batches.append(idxs_batch)
-            task = executor.submit(encode_faster, model, documents_batch)
-            embed_tasks.append(task)
-
-        # wait for the remaining tasks to finish
-        while embed_tasks:
-            embeddings_batch = embed_tasks.popleft().result()
+    with tqdm(disable=(not progress)) as count:
+        idxs_batches, documents_batches = iunzip(batches, 2)
+        documents_batches = iunsqueeze(documents_batches)
+        embeddings_batches = imap(
+            documents_batches, lambda x: encode_faster(model, x), n_tasks
+        )
+        batches_out = zip(idxs_batches, embeddings_batches)
+        for idxs_batch, embeddings_batch in batches_out:
             count.update(len(embeddings_batch))
-            yield idxs_batches.popleft(), embeddings_batch
+            yield idxs_batch, embeddings_batch
 
 
 def main():

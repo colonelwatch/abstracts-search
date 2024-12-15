@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from itertools import accumulate, tee
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from pathlib import Path
 from shutil import rmtree, move
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Generator, Literal, overload, TypedDict
 
 from datasets import Dataset, disable_progress_bars, disable_caching
 from datasets.config import HF_DATASETS_CACHE
@@ -34,9 +35,13 @@ import numpy.typing as npt
 import torch
 from tqdm import tqdm
 
+from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
+
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
+N_TASKS = 2  # TODO: make configurable
 
 logger = logging.getLogger(__name__)
+torch_norm = torch.nn.functional.normalize
 
 
 class IndexParameters(TypedDict):
@@ -109,6 +114,33 @@ def hash(parameters: list) -> str:
     return h.hexdigest()
 
 
+@overload
+def iter_tensors(
+    dataset: Dataset, batch_size: int, embeddings_only: Literal[False] = False
+) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
+    ...
+
+@overload  # noqa: E302
+def iter_tensors(
+    dataset: Dataset, batch_size: int, embeddings_only: Literal[True]
+) -> Generator[torch.Tensor, None, None]:
+    ...
+
+def iter_tensors(  # noqa: E302
+    dataset: Dataset, batch_size: int, embeddings_only: bool = False
+) -> (
+    Generator[tuple[torch.Tensor, torch.Tensor], None, None] |
+    Generator[torch.Tensor, None, None]
+):
+    columns = ["embeddings"] if embeddings_only else ["ids", "embeddings"]
+    with dataset.formatted_as("torch", columns=columns):
+        for batch in dataset.iter(batch_size):
+            if embeddings_only:
+                yield batch["embeddings"]  # type: ignore
+            else:
+                yield batch["ids"], batch["embeddings"]  # type: ignore
+
+
 def create_memmap(
     cache_dir: Path,
     dataset: Dataset,
@@ -121,38 +153,30 @@ def create_memmap(
     d = len(dataset[0]["embeddings"]) if dimensions is None else dimensions
     shape = (n, d)
 
-    cache_identifier = hash(
-        [
-            dataset._fingerprint,
-            dimensions,
-            normalize
-        ]
-    )
+    cache_identifier = hash([dataset._fingerprint, dimensions, normalize])
     cache_path = cache_dir / f"train_{cache_identifier}.memmap"
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
+    def preproc(device: torch.device, x: torch.Tensor) -> torch.Tensor:
+        if dimensions is not None:
+            x = x[:, :dimensions]
+        x = x.to(device, non_blocking=True)
+        if normalize:
+            x = torch.nn.functional.normalize(x)
+        return x.cpu()
+
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        with (
-            dataset.formatted_as("torch", columns=["embeddings"]),
-            tqdm(total=len(dataset), disable=(not progress)) as counter
-        ):
+        batches = iter_tensors(dataset, batch_size, embeddings_only=True)
+        batches = iunsqueeze(batches)
+        batches = imap_multi_gpu(batches, preproc, N_TASKS)
+        with tqdm(total=len(dataset), disable=(not progress)) as counter:
             i = 0
-            for batch in dataset.iter(batch_size):
-                embeddings_batch: torch.Tensor = batch["embeddings"]  # type: ignore
+            for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
-
-                if dimensions is not None:
-                    embeddings_batch = embeddings_batch[:, :dimensions]
-                embeddings_batch = embeddings_batch.cuda(non_blocking=True)
-                if normalize:
-                    embeddings_batch = torch.nn.functional.normalize(embeddings_batch)
-                embeddings_batch = embeddings_batch.cpu()
-
-                memmap[i:(i + n_batch)] = embeddings_batch.cpu().numpy()
+                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
                 i += n_batch
-
                 counter.update(n_batch)
     except (KeyboardInterrupt, Exception):
         cache_path.unlink()
@@ -162,7 +186,6 @@ def create_memmap(
     return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
 
-# TODO: multithread?
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
     cache_dir: Path,
@@ -170,7 +193,7 @@ def make_ground_truth(
     queries: Dataset,
     normalize: bool,
     batch_size: int,
-    k: int,
+    k: int | None,
     inner_product: bool,
     progress: bool,
 ) -> Dataset:
@@ -188,75 +211,103 @@ def make_ground_truth(
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
 
-    with queries.formatted_as("torch", columns=["embeddings", "ids"], device="cuda"):
+    with queries.formatted_as("torch", columns=["embeddings", "ids"]):
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
-    if normalize:
-        q = torch.nn.functional.normalize(q)
+        if normalize:
+            q = torch.nn.functional.normalize(q)
+
+    n_devices = torch.cuda.device_count()
+    q_copy = [q.to(f"cuda:{i}") for i in range(n_devices)]
+    q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
+
+    if k is None:
+        k = 1  # 1-Recall @ 1
+
+    def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
+        return len(ids)
+
+    def local_topk(
+        device: torch.device, d_batch_ids: torch.Tensor, d_batch: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        d_batch = d_batch.to(device, non_blocking=True)
+        d_batch_ids = d_batch_ids.to(device, non_blocking=True)
+
+        not_in_queries = torch.isin(d_batch_ids, q_ids_copy[device.index], invert=True)
+        d_batch = d_batch[not_in_queries]
+        d_batch_ids = d_batch_ids[not_in_queries]
+
+        if normalize:
+            d_batch = torch.nn.functional.normalize(d_batch)
+
+        if inner_product:
+            scores_batch = q_copy[device.index] @ d_batch.T
+        else:
+            # prefer direct calc over following the quadratic form with matmult
+            scores_batch = torch.cdist(
+                q, d_batch, compute_mode="donot_use_mm_for_euclid_dist"
+            )
+
+        top_scores_batch, argtop = torch.topk(scores_batch, k, 1, inner_product)
+        top_ids_batch = d_batch_ids[argtop.flatten()].reshape(argtop.shape)
+
+        if n_devices > 1:
+            return top_ids_batch.cpu(), top_scores_batch.cpu()
+        else:
+            return top_ids_batch, top_scores_batch
+
+    def reduce_topk(
+        gt: tuple[torch.Tensor, torch.Tensor],
+        local_top: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gt_ids, gt_scores = gt
+        top_ids_batch, top_scores_batch = local_top
+
+        top_ids_batch = top_ids_batch.cuda(non_blocking=True)
+        top_scores_batch = top_scores_batch.cuda(non_blocking=True)
+
+        gt_scores = torch.hstack((gt_scores, top_scores_batch))
+        gt_ids = torch.hstack((gt_ids, top_ids_batch))
+        gt_scores, argtop = torch.topk(gt_scores, k, 1, inner_product)
+        gt_ids = torch.gather(gt_ids, 1, argtop)
+
+        return gt_ids, gt_scores
 
     n_q, _ = q.shape
-    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32, device="cuda")
+    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32).cuda()
     if inner_product:
-        gt_scores = torch.zeros((n_q, k), dtype=torch.float32, device="cuda")
+        gt_scores = torch.zeros((n_q, k), dtype=torch.float32).cuda()
     else:
-        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32, device="cuda")
+        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32).cuda()
 
-    with (
-        dataset.formatted_as("torch", columns=["embeddings", "ids"]),
-        tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter,
-    ):
-        for batch in dataset.iter(batch_size):
-            d_batch: torch.Tensor = batch["embeddings"]  # type: ignore
-            d_batch_ids: torch.Tensor = batch["ids"]  # type: ignore
+    with tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter:
+        batches = iter_tensors(dataset, batch_size)
+        batches, batches_copy = tee(batches, 2)
+        lengths = imap(batches_copy, get_length, None)
+        batches = imap_multi_gpu(batches, local_topk, N_TASKS)
+        batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
+        batches = zip(lengths, batches)
+        for length, (gt_ids, _) in batches:
+            counter.update(length)
 
-            d_batch = d_batch.cuda(non_blocking=True)
-            d_batch_ids = d_batch_ids.cuda(non_blocking=True)
-
-            not_in_queries = torch.isin(
-                d_batch_ids, q_ids, assume_unique=True, invert=True
-            )
-            d_batch = d_batch[not_in_queries]
-            d_batch_ids = d_batch_ids[not_in_queries]
-
-            if normalize:
-                d_batch = torch.nn.functional.normalize(d_batch)
-
-            if inner_product:
-                scores_batch = q @ d_batch.T
-                largest = True
-            else:
-                # prefer direct calc over following the quadratic form with matmult
-                scores_batch = torch.cdist(
-                    q, d_batch, compute_mode="donot_use_mm_for_euclid_dist"
-                )
-                largest = False
-
-            top_scores_batch, argtop = torch.topk(scores_batch, k, 1, largest)
-            top_ids_batch = d_batch_ids[argtop.flatten()].reshape(argtop.shape)
-
-            gt_scores = torch.hstack((gt_scores, top_scores_batch))
-            gt_ids = torch.hstack((gt_ids, top_ids_batch))
-            gt_scores, argtop = torch.topk(gt_scores, k, 1, largest)
-            gt_ids = torch.gather(gt_ids, 1, argtop)
-
-            counter.update(len(d_batch))
+    gt_ids = gt_ids.cpu()
 
     ground_truth = Dataset.from_dict(
         {
             "embeddings": queries["embeddings"],
-            "gt_ids": gt_ids.cpu().numpy().astype(np.int64),
+            "gt_ids": gt_ids.numpy().astype(np.int64),
         }
     )
     ground_truth.save_to_disk(cache_path)
     return ground_truth
 
 
-def to_gpu(index: faiss.Index) -> faiss.Index:
+def to_gpu(index: faiss.Index, device: int = 0) -> faiss.Index:
     opts = faiss.GpuClonerOptions()
     opts.useFloat16 = True  # float16 is necessary for codes sized 56 bits and over
     env = faiss.StandardGpuResources()
-    return faiss.index_cpu_to_gpu(env, 0, index, opts)
+    return faiss.index_cpu_to_gpu(env, device, index, opts)
 
 
 def to_cpu(index: faiss.Index) -> faiss.Index:
@@ -291,57 +342,77 @@ def fill_index(
     batch_size: int,
     shard_size: int,
     cache_dir: Path,
+    progress: bool,
     holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
-    holdout_ids_tensor = None if holdout_ids is None else torch.from_numpy(holdout_ids)
+    if holdout_ids is not None:
+        holdouts = torch.from_numpy(holdout_ids)
+        holdouts_copy = [
+            holdouts.to(f"cuda:{i}")
+            for i in range(torch.cuda.device_count())
+        ]
+        n_dataset = len(dataset) - len(holdout_ids)
+    else:
+        holdouts_copy = None
+        n_dataset = len(dataset)
+
+    def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
+        return len(ids)
+
+    def preproc(
+        device: torch.device, ids: torch.Tensor, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if dimensions is not None:
+            x = x[:, :dimensions]
+        x = x.to(device, non_blocking=True)
+        if normalize:
+            x = torch.nn.functional.normalize(x)
+        if holdouts_copy is not None:
+            ids = ids.to(device, non_blocking=True)
+            not_in = torch.isin(ids, holdouts_copy[device.index], invert=True)
+            ids = ids[not_in]
+            x = x[not_in]
+        return ids.cpu(), x.cpu()
+
+    def make_shard_index(device: torch.device, shard_start: int) -> faiss.Index:
+        dev_id = device.index
+
+        on_gpu = to_gpu(trained_index, device=dev_id)
+        shard = dataset.select(
+            range(shard_start, min(shard_start + shard_size, len(dataset)))
+        )
+
+        batches = iter_tensors(shard, batch_size)
+        batches, batches_copy = tee(batches, 2)
+        lengths = imap(batches_copy, get_length, None)
+        batches = imap(batches, lambda ids, x: preproc(device, ids, x), None)
+        batches = zip(lengths, batches)
+        with tqdm(total=len(shard), disable=(not progress), position=(dev_id + 1)) as c:
+            for n_batch, (ids, x) in batches:
+                on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
+                c.update(n_batch)
+        
+        return to_cpu(on_gpu)
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
-        chunk_paths: list[Path] = []
-        on_gpu = to_gpu(trained_index)
-        for i_shard, shard_start in enumerate(range(0, len(dataset), shard_size)):
-            shard = dataset.select(
-                range(shard_start, min(shard_start + shard_size, len(dataset)))
-            )
+        shards = range(0, n_dataset, shard_size)
+        n_shards = len(shards)
+        shards = iunsqueeze(shards)
+        shards = imap_multi_gpu(shards, make_shard_index, N_TASKS)
+        shards = tqdm(shards, total=n_shards, disable=(not progress), position=0)
 
-            for batch_start in range(0, len(shard), batch_size):
-                batch = shard.select(
-                    range(batch_start, min(batch_start + batch_size, len(shard)))
-                )
-                with batch.formatted_as("torch"):
-                    batch_ids: torch.Tensor = batch["ids"]  # type: ignore
-                    batch_embeddings: torch.Tensor = batch["embeddings"]  # type: ignore
-
-                # TODO: is this slower than precalculating a mask?
-                if holdout_ids_tensor is not None:
-                    not_in_test_set = torch.isin(
-                        batch_ids, holdout_ids_tensor, assume_unique=True, invert=True
-                    )
-                    batch_ids = batch_ids[not_in_test_set]
-                    batch_embeddings = batch_embeddings[not_in_test_set]
-
-                if dimensions is not None:
-                    batch_embeddings = batch_embeddings[:, :dimensions]
-                batch_embeddings = batch_embeddings.cuda(non_blocking=True)
-                if normalize:
-                    batch_embeddings = torch.nn.functional.normalize(batch_embeddings)
-                batch_embeddings = batch_embeddings.cpu()
-
-                on_gpu.add_with_ids(batch_embeddings.numpy(), batch_ids)  # type: ignore
-
-            shard_index = to_cpu(on_gpu)
+        shard_paths: list[Path] = []
+        for i_shard, shard_index in enumerate(shards):
             path = Path(tmpdir) / f"index_{i_shard:03d}.faiss'"
             faiss.write_index(shard_index, str(path))
+            shard_paths.append(path)
 
-            chunk_paths.append(path)
-            on_gpu.reset()
-
-        # TODO: investigate why I build in current working directory first
         temp_vectors_path = Path(vectors_filename)
         vectors_path = index_dir / vectors_filename
         index_path = index_dir / index_filename
         try:
             index = faiss.clone_index(trained_index)
-            merge_ondisk(index, [str(p) for p in chunk_paths], str(temp_vectors_path))
+            merge_ondisk(index, [str(p) for p in shard_paths], str(temp_vectors_path))
             move(temp_vectors_path, vectors_path)
             faiss.write_index(index, str(index_path))
         except (KeyboardInterrupt, Exception):
@@ -358,7 +429,7 @@ def tune_index(
     ground_truth: Dataset,
     dimensions: int | None,
     normalize: bool,
-    k: int,
+    k: int | None,
     progress: bool
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
@@ -372,8 +443,10 @@ def tune_index(
 
     # init with ground-truth IDs but not ground-truth distances because faiss doesn't
     # use them anyway (see faiss/AutoTune.cpp)
-    # criterion = faiss.IntersectionCriterion(len(ground_truth), k)
-    criterion = faiss.OneRecallAtRCriterion(len(ground_truth), 1)
+    if k is None:
+        criterion = faiss.OneRecallAtRCriterion(len(ground_truth), 1)
+    else:
+        criterion = faiss.IntersectionCriterion(len(ground_truth), k)
     criterion.set_groundtruth(None, gt_ids)  # type: ignore (monkey-patched)
 
     params = faiss.ParameterSpace()
@@ -529,6 +602,7 @@ def main():
             args.batch_size,
             args.shard_size,
             cache_dir,
+            progress,
             holdout_ids=q_ids
         )
         optimal_params = tune_index(
@@ -549,7 +623,8 @@ def main():
             faiss_index,
             args.batch_size,
             args.shard_size,
-            cache_dir
+            cache_dir,
+            progress,
         )
     except (KeyboardInterrupt, Exception):
         rmtree(dest)
