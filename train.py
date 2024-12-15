@@ -38,7 +38,6 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
-N_TASKS = 2  # TODO: make configurable
 
 logger = logging.getLogger(__name__)
 torch_norm = torch.nn.functional.normalize
@@ -73,13 +72,14 @@ def parse_args() -> Namespace:
     train.add_argument("dest", type=Path)
     train.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
     train.add_argument("-N", "--normalize", action="store_true")
-    train.add_argument("-i", "--inner-product", action="store_true")
-    train.add_argument("-k", "--intersection", default=10, type=int)
+    train.add_argument("-I", "--inner-product", action="store_true")
+    train.add_argument("-k", "--intersection", default=None, type=int)
     train.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
     train.add_argument("-q", "--queries", default=16384, type=int)
-    train.add_argument("-b", "--batch-size", default=1024, type=int)
+    train.add_argument("-t", "--tasks", default=None, type=int)
     train.add_argument("-P", "--progress", action="store_true")
-    train.add_argument("-t", "--truncate", default=None, type=int)
+    train.add_argument("--truncate", default=None, type=int)
+    train.add_argument("--batch-size", default=1024, type=int)
     train.add_argument("--shard-size", default=4194304, type=int)
     train.add_argument("--use-cache", action="store_true")
 
@@ -147,6 +147,7 @@ def create_memmap(
     dimensions: int | None,
     normalize: bool,
     batch_size: int,
+    n_tasks: int,
     progress: bool
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
@@ -170,7 +171,7 @@ def create_memmap(
     try:
         batches = iter_tensors(dataset, batch_size, embeddings_only=True)
         batches = iunsqueeze(batches)
-        batches = imap_multi_gpu(batches, preproc, N_TASKS)
+        batches = imap_multi_gpu(batches, preproc, n_tasks)
         with tqdm(total=len(dataset), disable=(not progress)) as counter:
             i = 0
             for embeddings_batch in batches:
@@ -195,6 +196,7 @@ def make_ground_truth(
     batch_size: int,
     k: int | None,
     inner_product: bool,
+    n_tasks: int,
     progress: bool,
 ) -> Dataset:
     cache_identifier = hash(
@@ -285,7 +287,7 @@ def make_ground_truth(
         batches = iter_tensors(dataset, batch_size)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, None)
-        batches = imap_multi_gpu(batches, local_topk, N_TASKS)
+        batches = imap_multi_gpu(batches, local_topk, n_tasks)
         batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
         batches = zip(lengths, batches)
         for length, (gt_ids, _) in batches:
@@ -330,7 +332,6 @@ def train_index(
     return index
 
 
-# TODO: add progress bar
 def fill_index(
     index_dir: Path,
     index_filename: str,
@@ -342,6 +343,7 @@ def fill_index(
     batch_size: int,
     shard_size: int,
     cache_dir: Path,
+    n_tasks: int,
     progress: bool,
     holdout_ids: npt.NDArray | None = None,
 ) -> faiss.Index:
@@ -398,7 +400,7 @@ def fill_index(
         shards = range(0, n_dataset, shard_size)
         n_shards = len(shards)
         shards = iunsqueeze(shards)
-        shards = imap_multi_gpu(shards, make_shard_index, N_TASKS)
+        shards = imap_multi_gpu(shards, make_shard_index, n_tasks)
         shards = tqdm(shards, total=n_shards, disable=(not progress), position=0)
 
         shard_paths: list[Path] = []
@@ -557,6 +559,10 @@ def main():
     if not progress:
         disable_progress_bars()
 
+    n_tasks: int | None = args.tasks
+    if n_tasks is None:
+        n_tasks = torch.cuda.device_count() + 2
+
     dataset = load_dataset(source)
     dataset = add_id_column(dataset)
     truncate: int | None = args.truncate
@@ -579,11 +585,12 @@ def main():
         args.batch_size,
         args.intersection,
         args.inner_product,
+        n_tasks,
         progress,
     )
 
     train_memmap = create_memmap(
-        cache_dir, train, dimensions, normalize, args.batch_size, progress
+        cache_dir, train, dimensions, normalize, args.batch_size, n_tasks, progress
     )
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
@@ -602,6 +609,7 @@ def main():
             args.batch_size,
             args.shard_size,
             cache_dir,
+            n_tasks,
             progress,
             holdout_ids=q_ids
         )
@@ -624,6 +632,7 @@ def main():
             args.batch_size,
             args.shard_size,
             cache_dir,
+            n_tasks,
             progress,
         )
     except (KeyboardInterrupt, Exception):
