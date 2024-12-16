@@ -20,6 +20,7 @@ from itertools import accumulate, tee
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from shutil import rmtree, move
 from sys import stderr
@@ -40,9 +41,11 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
+OPQ_PATTERN = re.compile(r"OPQ([0-9]+)(?:_([0-9]+))?")
+PCAR_PATTERN = re.compile(r"PCAR([0-9]+)")
+VALID_OPQ_WIDTHS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32, 48, 56, 64, 96]
 
 logger = logging.getLogger(__name__)
-torch_norm = torch.nn.functional.normalize
 
 
 class IndexParameters(TypedDict):
@@ -75,6 +78,7 @@ def parse_args() -> Namespace:
     train.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
     train.add_argument("-N", "--normalize", action="store_true")
     train.add_argument("-I", "--inner-product", action="store_true")
+    train.add_argument("-p", "--preprocess", default="OPQ96_384")
     train.add_argument("-k", "--intersection", default=None, type=int)
     train.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
     train.add_argument("-q", "--queries", default=16384, type=int)
@@ -106,6 +110,7 @@ class TrainArgs:
     dimensions: int | None
     normalize: bool
     inner_product: bool
+    preprocess: str
     intersection: int | None
     clusters: int | None
     queries: int
@@ -131,9 +136,21 @@ class TrainArgs:
             self.normalize = True
             warnings.warn("inferring --normalize from --dimension")
 
+        if not (
+            (
+                (match := OPQ_PATTERN.match(self.preprocess)) and
+                int(match[1]) in VALID_OPQ_WIDTHS
+            ) or
+            PCAR_PATTERN.match(self.preprocess)
+        ):
+            raise ValueError(f'preprocess string "{self.preprocess}" is not valid')
+
     @property
-    def n_tasks(self) -> int:
-        return torch.cuda.device_count() + 2 if self.tasks is None else self.tasks
+    def ivf_encoding(self) -> str:
+        if match := OPQ_PATTERN.match(self.preprocess):
+            return f"OPQ{match[1]}"
+        else:  # PCAR_PATTERN.match(self.preprocess)
+            return "SQ8"
 
     @property
     def one_recall_at_one(self) -> bool:
@@ -142,6 +159,10 @@ class TrainArgs:
     @property
     def k(self) -> int:
         return 1 if self.intersection is None else self.intersection
+
+    @property
+    def n_tasks(self) -> int:
+        return torch.cuda.device_count() + 2 if self.tasks is None else self.tasks
 
 
 def load_dataset(dir: Path) -> Dataset:
@@ -588,7 +609,7 @@ def main():
         clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
     else:
         clusters = args.clusters
-    factory_string = f"OPQ96_288,IVF{clusters},PQ96"
+    factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
     train_size = TRAIN_SIZE_MULTIPLE * clusters
 
     train, queries = splits(dataset, train_size, args.queries)
