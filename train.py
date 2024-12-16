@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass
 from itertools import accumulate, tee
 import json
 import logging
@@ -86,6 +87,62 @@ def parse_args() -> Namespace:
     return parser.parse_args()
 
 
+@dataclass
+class CleanArgs:
+    mode: Literal["clean"]
+    source: Path | None
+
+    @classmethod
+    def from_namespace(cls, namespace: Namespace):
+        return cls(**vars(namespace))
+
+
+@dataclass
+class TrainArgs:
+    mode: Literal["train"]
+    source: Path
+    dest: Path
+    dimensions: int | None
+    normalize: bool
+    inner_product: bool
+    intersection: int | None
+    clusters: int | None
+    queries: int
+    tasks: int | None
+    progress: bool
+    truncate: bool
+    batch_size: int
+    shard_size: int
+    use_cache: bool
+
+    @classmethod
+    def from_namespace(cls, namespace: Namespace):
+        return cls(**vars(namespace))
+
+    def __post_init__(self):
+        if not self.source.exists():
+            raise ValueError(f'source path "{self.source}" does not exist')
+
+        if self.dest.exists():
+            raise ValueError(f'destination path "{self.dest}" exists')
+
+        if self.dimensions is not None and not self.normalize:
+            print("warning: inferring --normalize from --dimension", file=stderr)
+            self.normalize = True
+
+    @property
+    def n_tasks(self) -> int:
+        return torch.cuda.device_count() + 2 if self.tasks is None else self.tasks
+
+    @property
+    def one_recall_at_one(self) -> bool:
+        return self.intersection is None
+
+    @property
+    def k(self) -> int:
+        return 1 if self.intersection is None else self.intersection
+
+
 def load_dataset(dir: Path) -> Dataset:
     paths = [str(path) for path in dir.glob("*.parquet")]
     dataset: Dataset = Dataset.from_parquet(paths)  # type: ignore
@@ -135,37 +192,31 @@ def iter_tensors(  # noqa: E302
 
 
 def create_memmap(
-    dataset: Dataset,
-    dimensions: int | None,
-    normalize: bool,
-    cache_dir: Path,
-    batch_size: int,
-    n_tasks: int,
-    progress: bool
+    dataset: Dataset, cache_dir: Path, args: TrainArgs
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
-    d = len(dataset[0]["embeddings"]) if dimensions is None else dimensions
+    d = len(dataset[0]["embeddings"]) if args.dimensions is None else args.dimensions
     shape = (n, d)
 
-    cache_identifier = hash([dataset._fingerprint, dimensions, normalize])
+    cache_identifier = hash([dataset._fingerprint, args.dimensions, args.normalize])
     cache_path = cache_dir / f"train_{cache_identifier}.memmap"
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
     def preproc(device: torch.device, x: torch.Tensor) -> torch.Tensor:
-        if dimensions is not None:
-            x = x[:, :dimensions]
+        if args.dimensions is not None:
+            x = x[:, :args.dimensions]
         x = x.to(device, non_blocking=True)
-        if normalize:
+        if args.normalize:
             x = torch.nn.functional.normalize(x)
         return x.cpu()
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        batches = iter_tensors(dataset, batch_size, embeddings_only=True)
+        batches = iter_tensors(dataset, args.batch_size, embeddings_only=True)
         batches = iunsqueeze(batches)
-        batches = imap_multi_gpu(batches, preproc, n_tasks)
-        with tqdm(total=len(dataset), disable=(not progress)) as counter:
+        batches = imap_multi_gpu(batches, preproc, args.n_tasks)
+        with tqdm(total=len(dataset), disable=(not args.progress)) as counter:
             i = 0
             for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
@@ -182,24 +233,16 @@ def create_memmap(
 
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
-    dataset: Dataset,
-    queries: Dataset,
-    normalize: bool,
-    batch_size: int,
-    k: int | None,
-    inner_product: bool,
-    cache_dir: Path,
-    n_tasks: int,
-    progress: bool,
+    dataset: Dataset, queries: Dataset, cache_dir: Path, args: TrainArgs
 ) -> Dataset:
     cache_identifier = hash(
         [
             dataset._fingerprint,
             queries._fingerprint,
-            normalize,
-            batch_size,
-            k,
-            inner_product
+            args.normalize,
+            args.batch_size,
+            args.k,
+            args.inner_product
         ]
     )
     cache_path = cache_dir / f"gt_{cache_identifier}"
@@ -210,15 +253,12 @@ def make_ground_truth(
         q: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
-        if normalize:
+        if args.normalize:
             q = torch.nn.functional.normalize(q)
 
     n_devices = torch.cuda.device_count()
     q_copy = [q.to(f"cuda:{i}") for i in range(n_devices)]
     q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
-
-    if k is None:
-        k = 1  # 1-Recall @ 1
 
     def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
         return len(ids)
@@ -233,10 +273,10 @@ def make_ground_truth(
         d_batch = d_batch[not_in_queries]
         d_batch_ids = d_batch_ids[not_in_queries]
 
-        if normalize:
+        if args.normalize:
             d_batch = torch.nn.functional.normalize(d_batch)
 
-        if inner_product:
+        if args.inner_product:
             scores_batch = q_copy[device.index] @ d_batch.T
         else:
             # prefer direct calc over following the quadratic form with matmult
@@ -246,7 +286,9 @@ def make_ground_truth(
                 compute_mode="donot_use_mm_for_euclid_dist"
             )
 
-        top_scores_batch, argtop = torch.topk(scores_batch, k, 1, inner_product)
+        top_scores_batch, argtop = torch.topk(
+            scores_batch, args.k, dim=1, largest=args.inner_product
+        )
         top_ids_batch = d_batch_ids[argtop.flatten()].reshape(argtop.shape)
 
         if n_devices > 1:
@@ -266,27 +308,29 @@ def make_ground_truth(
 
         gt_scores = torch.hstack((gt_scores, top_scores_batch))
         gt_ids = torch.hstack((gt_ids, top_ids_batch))
-        gt_scores, argtop = torch.topk(gt_scores, k, 1, inner_product)
+        gt_scores, argtop = torch.topk(
+            gt_scores, args.k, dim=1, largest=args.inner_product
+        )
         gt_ids = torch.gather(gt_ids, 1, argtop)
 
         return gt_ids, gt_scores
 
     n_q, _ = q.shape
-    gt_ids = torch.full((n_q, k), -1, dtype=torch.int32).cuda()
-    if inner_product:
-        gt_scores = torch.zeros((n_q, k), dtype=torch.float32).cuda()
+    gt_ids = torch.full((n_q, args.k), -1, dtype=torch.int32).cuda()
+    if args.inner_product:
+        gt_scores = torch.zeros((n_q, args.k), dtype=torch.float32).cuda()
     else:
-        gt_scores = torch.full((n_q, k), torch.inf, dtype=torch.float32).cuda()
+        gt_scores = torch.full((n_q, args.k), torch.inf, dtype=torch.float32).cuda()
 
-    with tqdm(total=(len(dataset) - len(queries)), disable=(not progress)) as counter:
-        batches = iter_tensors(dataset, batch_size)
+    with tqdm(total=(len(dataset) - len(queries)), disable=(not args.progress)) as c:
+        batches = iter_tensors(dataset, args.batch_size)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, None)
-        batches = imap_multi_gpu(batches, local_topk, n_tasks)
+        batches = imap_multi_gpu(batches, local_topk, args.n_tasks)
         batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
         batches = zip(lengths, batches)
         for length, (gt_ids, _) in batches:
-            counter.update(length)
+            c.update(length)
 
     gt_ids = gt_ids.cpu()
 
@@ -328,18 +372,14 @@ def train_index(
 
 
 def fill_index(
-    index_path: Path,
-    ivf_path: Path,
+    dest: Path,
     trained_index: faiss.Index,
     dataset: Dataset,
     holdout_ids: npt.NDArray | None,
-    dimensions: int | None,
-    normalize: bool,
     cache_dir: Path,
-    batch_size: int,
-    shard_size: int,
-    n_tasks: int,
-    progress: bool,
+    args: TrainArgs,
+    index_filename: str = "index.faiss",
+    ivf_filename: str = "index.ivfdata",
 ) -> faiss.Index:
     if holdout_ids is not None:
         holdouts_cpu = torch.from_numpy(holdout_ids)
@@ -358,10 +398,10 @@ def fill_index(
     def preproc(
         device: torch.device, ids: torch.Tensor, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if dimensions is not None:
-            x = x[:, :dimensions]
+        if args.dimensions is not None:
+            x = x[:, :args.dimensions]
         x = x.to(device, non_blocking=True)
-        if normalize:
+        if args.normalize:
             x = torch.nn.functional.normalize(x)
         if holdouts is not None:
             ids = ids.to(device, non_blocking=True)
@@ -375,15 +415,19 @@ def fill_index(
 
         on_gpu = to_gpu(trained_index, device=dev_id)
         shard = dataset.select(
-            range(shard_start, min(shard_start + shard_size, len(dataset)))
+            range(shard_start, min(shard_start + args.shard_size, len(dataset)))
         )
 
-        batches = iter_tensors(shard, batch_size)
+        batches = iter_tensors(shard, args.batch_size)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, None)
         batches = imap(batches, lambda ids, x: preproc(device, ids, x), None)
         batches = zip(lengths, batches)
-        with tqdm(total=len(shard), disable=(not progress), position=(dev_id + 1)) as c:
+        with (
+            tqdm(
+                total=len(shard), disable=(not args.progress), position=(dev_id + 1)
+            )
+        ) as c:
             for n_batch, (ids, x) in batches:
                 on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
                 c.update(n_batch)
@@ -391,11 +435,11 @@ def fill_index(
         return to_cpu(on_gpu)
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
-        shards = range(0, n_dataset, shard_size)
+        shards = range(0, n_dataset, args.shard_size)
         n_shards = len(shards)
         shards = iunsqueeze(shards)
-        shards = imap_multi_gpu(shards, make_shard_index, n_tasks)
-        shards = tqdm(shards, total=n_shards, disable=(not progress), position=0)
+        shards = imap_multi_gpu(shards, make_shard_index, args.n_tasks)
+        shards = tqdm(shards, total=n_shards, disable=(not args.progress), position=0)
 
         shard_paths: list[Path] = []
         for i_shard, shard_index in enumerate(shards):
@@ -403,48 +447,45 @@ def fill_index(
             faiss.write_index(shard_index, str(path))
             shard_paths.append(path)
 
-        temp_ivf_path = Path(ivf_path.name)
+        index_path = dest / index_filename
+        ivf_path = dest / ivf_filename
+        temp_ivf_path = Path(ivf_filename)
         try:
             index = faiss.clone_index(trained_index)
             merge_ondisk(index, [str(p) for p in shard_paths], str(temp_ivf_path))
             move(temp_ivf_path, ivf_path)
             faiss.write_index(index, str(index_path))
         except (KeyboardInterrupt, Exception):
-            temp_ivf_path.unlink(missing_ok=True)
-            ivf_path.unlink(missing_ok=True)
             index_path.unlink(missing_ok=True)
+            ivf_path.unlink(missing_ok=True)
+            temp_ivf_path.unlink(missing_ok=True)
             raise
 
     return index
 
 
 def tune_index(
-    filled_index: faiss.Index,
-    ground_truth: Dataset,
-    dimensions: int | None,
-    normalize: bool,
-    k: int | None,
-    progress: bool
+    filled_index: faiss.Index, ground_truth: Dataset, args: TrainArgs
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
         q: npt.NDArray[np.float32] = ground_truth["embeddings"]  # type: ignore
         gt_ids: npt.NDArray[np.int64] = ground_truth["gt_ids"]  # type: ignore
 
-    if dimensions is not None:
-        q = q[:, :dimensions]
-    if normalize:
+    if args.dimensions is not None:
+        q = q[:, :args.dimensions]
+    if args.normalize:
         q = q / np.linalg.norm(q, ord=2, axis=1)[:, np.newaxis]
 
     # init with ground-truth IDs but not ground-truth distances because faiss doesn't
     # use them anyway (see faiss/AutoTune.cpp)
-    if k is None:
+    if args.one_recall_at_one:
         criterion = faiss.OneRecallAtRCriterion(len(ground_truth), 1)
     else:
-        criterion = faiss.IntersectionCriterion(len(ground_truth), k)
+        criterion = faiss.IntersectionCriterion(len(ground_truth), args.k)
     criterion.set_groundtruth(None, gt_ids)  # type: ignore (monkey-patched)
 
     params = faiss.ParameterSpace()
-    params.verbose = progress
+    params.verbose = args.progress
     params.initialize(filled_index)
     results: faiss.OperatingPoints = params.explore(  # type: ignore (monkey-patched)
         filled_index, q, criterion
@@ -488,14 +529,15 @@ def main():
     args = parse_args()
 
     if args.mode == "clean":
+        args = CleanArgs.from_namespace(args)
+
         if cache_dir.exists():
             rmtree(cache_dir)
 
         # get cache directory path by following the path to an individual cache file
         # NOTE: if the cache wasn't created, this will create then delete the cache
-        clean_source: Path | None = args.source
-        if clean_source is not None and clean_source.exists():
-            dataset = load_dataset(clean_source)
+        if args.source is not None and args.source.exists():
+            dataset = load_dataset(args.source)
             file_0_path = Path(dataset.cache_files[0]["filename"])
             del dataset
 
@@ -527,108 +569,53 @@ def main():
 
     cache_dir.mkdir(exist_ok=True)
 
-    source: Path = args.source
-    if not source.exists():
-        print(f'error: source path "{source}" does not exist', file=stderr)
+    try:
+        args = TrainArgs.from_namespace(args)
+    except ValueError as e:
+        print("error:", e.args[0], file=stderr)
         return 1
-
-    dest: Path = args.dest
-    if dest.exists():
-        print(f'error: destination path "{dest}" exists', file=stderr)
-        return 1
-
-    dimensions: int | None = args.dimensions
-    normalize: bool = args.normalize
-    if args.dimensions is not None and not args.normalize:
-        print("warning: inferring --normalize from --dimension", file=stderr)
-        normalize = True
 
     # run through global huggingface datasets settings
-    use_cache: bool = args.use_cache
-    progress: bool = args.progress
-    if not use_cache:
+    if not args.use_cache:
         disable_caching()  # caching is good for experimention, not otherwise
-    if not progress:
+    if not args.progress:
         disable_progress_bars()
 
-    n_tasks: int | None = args.tasks
-    if n_tasks is None:
-        n_tasks = torch.cuda.device_count() + 2
+    dataset = load_dataset(args.source)
+    if args.truncate is not None:
+        dataset = dataset.take(args.truncate)
 
-    dataset = load_dataset(source)
-    truncate: int | None = args.truncate
-    if truncate is not None:
-        dataset = dataset.take(truncate)
-
-    n_clusters: int | None = args.clusters
-    n_queries: int = args.queries
-    if n_clusters is None:
-        n_clusters = (len(dataset) - n_queries) // TRAIN_SIZE_MULTIPLE
-    factory_string = f"OPQ96,IVF{n_clusters},PQ96"
-    train_size = TRAIN_SIZE_MULTIPLE * n_clusters
+    if args.clusters is None:
+        clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
+    else:
+        clusters = args.clusters
+    factory_string = f"OPQ96_288,IVF{clusters},PQ96"
+    train_size = TRAIN_SIZE_MULTIPLE * clusters
 
     train, queries = splits(dataset, train_size, args.queries)
-    ground_truth = make_ground_truth(
-        dataset,
-        queries,
-        normalize,
-        args.batch_size,
-        args.intersection,
-        args.inner_product,
-        cache_dir,
-        n_tasks,
-        progress,
-    )
+    ground_truth = make_ground_truth(dataset, queries, cache_dir, args)
 
-    train_memmap = create_memmap(
-        train, dimensions, normalize, cache_dir, args.batch_size, n_tasks, progress
-    )
+    train_memmap = create_memmap(train, cache_dir, args)
 
     faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["ids"]  # type: ignore
-        index = fill_index(
-            Path(tmpdir) / "index.faiss",
-            Path(tmpdir) / "index.ivfdata",
-            faiss_index,
-            dataset,
-            q_ids,
-            dimensions,
-            normalize,
-            cache_dir,
-            args.batch_size,
-            args.shard_size,
-            n_tasks,
-            progress,
-        )
-        optimal_params = tune_index(
-            index, ground_truth, dimensions, normalize, args.intersection, progress
-        )
+        index = fill_index(Path(tmpdir), faiss_index, dataset, q_ids, cache_dir, args)
+        optimal_params = tune_index(index, ground_truth, args)
 
-    dest.mkdir()
+    args.dest.mkdir()
     try:
-        save_ids(dest / "ids.parquet", dataset, args.batch_size)
-        save_optimal_params(dest / "params.json", dimensions, normalize, optimal_params)
-        fill_index(
-            dest / "index.faiss",
-            dest / "index.ivfdata",
-            faiss_index,
-            dataset,
-            None,
-            dimensions,
-            normalize,
-            cache_dir,
-            args.batch_size,
-            args.shard_size,
-            n_tasks,
-            progress,
+        save_ids(args.dest / "ids.parquet", dataset, args.batch_size)
+        save_optimal_params(
+            args.dest / "params.json", args.dimensions, args.normalize, optimal_params
         )
+        fill_index(args.dest, faiss_index, dataset, None, cache_dir, args)
     except (KeyboardInterrupt, Exception):
-        rmtree(dest)
+        rmtree(args.dest)
         raise
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
