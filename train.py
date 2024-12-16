@@ -241,7 +241,9 @@ def make_ground_truth(
         else:
             # prefer direct calc over following the quadratic form with matmult
             scores_batch = torch.cdist(
-                q, d_batch, compute_mode="donot_use_mm_for_euclid_dist"
+                q_copy[device.index],
+                d_batch,
+                compute_mode="donot_use_mm_for_euclid_dist"
             )
 
         top_scores_batch, argtop = torch.topk(scores_batch, k, 1, inner_product)
