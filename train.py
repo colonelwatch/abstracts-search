@@ -414,9 +414,6 @@ def fill_index(
         holdouts = None
         n_dataset = len(dataset)
 
-    def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
-        return len(ids)
-
     def preproc(
         device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -439,16 +436,9 @@ def fill_index(
         )
 
         batches = iter_tensors(shard, args.batch_size)
-        batches, batches_copy = tee(batches, 2)
-        lengths = imap(batches_copy, get_length, None)
         batches = imap(batches, lambda ids, x: preproc(device, ids, x), None)
-        batches = zip(lengths, batches)
-        with tqdm(
-            total=len(shard), disable=(not args.progress), position=(device.index + 1)
-        ) as counter:
-            for n_batch, (ids, x) in batches:
-                on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
-                counter.update(n_batch)
+        for ids, x in batches:
+            on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
         
         return to_cpu(on_gpu)
 
