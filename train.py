@@ -324,7 +324,7 @@ def make_ground_truth(
     else:
         gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
 
-    with tqdm(total=(len(dataset) - len(queries)), disable=(not args.progress)) as c:
+    with tqdm(total=len(dataset), disable=(not args.progress)) as counter:
         batches = iter_tensors(dataset, args.batch_size)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, None)
@@ -332,7 +332,7 @@ def make_ground_truth(
         batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
         batches = zip(lengths, batches)
         for length, (gt_ids, _) in batches:
-            c.update(length)
+            counter.update(length)
 
     gt_ids = gt_ids.cpu()
 
