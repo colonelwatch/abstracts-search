@@ -89,20 +89,20 @@ def get_model(
 def load_oajsonl_batched(
     f: TextIO | BinaryIO, batch_size: int
 ) -> Generator[tuple[list[str], list[str]], None, None]:
-    idxs_batch: list[str] = []
+    ids_batch: list[str] = []
     documents_batch: list[str] = []
     for line in f:
         row = json.loads(line)
 
-        idxs_batch.append(row["id"])
+        ids_batch.append(row["id"])
         documents_batch.append(row["document"])
         if len(documents_batch) >= batch_size:
-            yield idxs_batch, documents_batch
-            idxs_batch = []
+            yield ids_batch, documents_batch
+            ids_batch = []
             documents_batch = []
 
     if documents_batch:
-        yield idxs_batch, documents_batch
+        yield ids_batch, documents_batch
 
 
 # built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
@@ -132,15 +132,15 @@ def encode_pipelined(
     progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
     with tqdm(disable=(not progress)) as count:
-        idxs_batches, documents_batches = iunzip(batches, 2)
+        ids_batches, documents_batches = iunzip(batches, 2)
         documents_batches = iunsqueeze(documents_batches)
         embeddings_batches = imap(
             documents_batches, lambda x: encode_faster(model, x), n_tasks
         )
-        batches_out = zip(idxs_batches, embeddings_batches)
-        for idxs_batch, embeddings_batch in batches_out:
+        batches_out = zip(ids_batches, embeddings_batches)
+        for ids_batch, embeddings_batch in batches_out:
             count.update(len(embeddings_batch))
-            yield idxs_batch, embeddings_batch
+            yield ids_batch, embeddings_batch
 
 
 def main():
@@ -166,8 +166,8 @@ def main():
         isolation_level="EXCLUSIVE",
         autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
     ) as conn:
-        for idxs_batch, embeddings_batch in batches:
-            insert_embeddings(idxs_batch, embeddings_batch, conn)
+        for ids_batch, embeddings_batch in batches:
+            insert_embeddings(ids_batch, embeddings_batch, conn)
 
 
 if __name__ == "__main__":

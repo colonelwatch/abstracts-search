@@ -148,7 +148,7 @@ def load_dataset(dir: Path) -> Dataset:
     paths = [str(path) for path in dir.glob("*.parquet")]
     dataset: Dataset = Dataset.from_parquet(paths)  # type: ignore
     ids = np.arange(len(dataset), dtype=np.int32)
-    return dataset.add_column("ids", ids)  # type: ignore (new_fingerprint not required)
+    return dataset.add_column("index", ids)  # type: ignore  (wrong func signature)
 
 
 def splits(
@@ -183,20 +183,20 @@ def iter_tensors(  # noqa: E302
     Generator[tuple[torch.Tensor, torch.Tensor], None, None] |
     Generator[torch.Tensor, None, None]
 ):
-    columns = ["embeddings"] if embeddings_only else ["ids", "embeddings"]
+    columns = ["embedding"] if embeddings_only else ["index", "embedding"]
     with dataset.formatted_as("torch", columns=columns):
         for batch in dataset.iter(batch_size):
             if embeddings_only:
-                yield batch["embeddings"]  # type: ignore
+                yield batch["embedding"]  # type: ignore
             else:
-                yield batch["ids"], batch["embeddings"]  # type: ignore
+                yield batch["index"], batch["embedding"]  # type: ignore
 
 
 def create_memmap(
     dataset: Dataset, cache_dir: Path, args: TrainArgs
 ) -> np.memmap[Any, np.dtype[np.float32]]:
     n = len(dataset)
-    d = len(dataset[0]["embeddings"]) if args.dimensions is None else args.dimensions
+    d = len(dataset[0]["embedding"]) if args.dimensions is None else args.dimensions
     shape = (n, d)
 
     cache_identifier = hash([dataset._fingerprint, args.dimensions, args.normalize])
@@ -250,9 +250,9 @@ def make_ground_truth(
     if cache_path.exists():
         return Dataset.load_from_disk(cache_path)
 
-    with queries.formatted_as("torch", columns=["embeddings", "ids"]):
-        q_embeddings: torch.Tensor = queries["embeddings"]  # type: ignore
-        q_ids: torch.Tensor = queries["ids"]  # type: ignore
+    with queries.formatted_as("torch", columns=["embedding", "index"]):
+        q_embeddings: torch.Tensor = queries["embedding"]  # type: ignore
+        q_ids: torch.Tensor = queries["index"]  # type: ignore
 
         if args.normalize:
             q_embeddings = torch.nn.functional.normalize(q_embeddings)
@@ -338,7 +338,7 @@ def make_ground_truth(
 
     ground_truth = Dataset.from_dict(
         {
-            "embeddings": q_embeddings,
+            "embedding": q_embeddings,
             "gt_ids": gt_ids.numpy().astype(np.int64),
         }
     )
@@ -465,7 +465,7 @@ def tune_index(
     filled_index: faiss.Index, ground_truth: Dataset, args: TrainArgs
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
-        q: npt.NDArray[np.float32] = ground_truth["embeddings"]  # type: ignore
+        q: npt.NDArray[np.float32] = ground_truth["embedding"]  # type: ignore
         gt_ids: npt.NDArray[np.int64] = ground_truth["gt_ids"]  # type: ignore
 
     if args.dimensions is not None:
@@ -501,7 +501,7 @@ def tune_index(
 
 
 def save_ids(path: Path, dataset: Dataset, batch_size: int):
-    dataset.remove_columns("embeddings").to_parquet(path, batch_size, compression="lz4")
+    dataset.remove_columns("embedding").to_parquet(path, batch_size, compression="lz4")
 
 
 def save_optimal_params(
@@ -601,7 +601,7 @@ def main():
         faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
         with queries.formatted_as("numpy"):
-            q_ids: npt.NDArray = queries["ids"]  # type: ignore
+            q_ids: npt.NDArray = queries["index"]  # type: ignore
         index = fill_index(Path(tmpdir), faiss_index, dataset, q_ids, args)
         optimal_params = tune_index(index, ground_truth, args)
 

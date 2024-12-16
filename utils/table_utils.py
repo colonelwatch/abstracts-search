@@ -28,7 +28,7 @@ def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
 
 def create_embeddings_table(conn: sqlite3.Connection):
     conn.execute(
-        "CREATE TABLE embeddings(oa_id TEXT PRIMARY KEY, embedding vector)"
+        "CREATE TABLE embeddings(id TEXT PRIMARY KEY, embedding vector)"
     )
 
 
@@ -37,7 +37,7 @@ def insert_embeddings(
 ):
     conn.executemany(
         "INSERT INTO embeddings VALUES(?, ?) "
-        "ON CONFLICT(oa_id) DO UPDATE SET embedding=excluded.embedding",
+        "ON CONFLICT(id) DO UPDATE SET embedding=excluded.embedding",
         zip(oa_ids, embeddings)
     )
 

@@ -45,58 +45,58 @@ def parse_args() -> Namespace:
 
 
 def to_arrays(
-    idxs: list[str], embeddings: list[npt.NDArray]
+    ids: list[str], embeddings: list[npt.NDArray]
 ) -> tuple[pa.Array, pa.Array]:
     dim = embeddings[0].shape[0]
     flattened = np.hstack(embeddings)
     embeddings_arr = pa.FixedSizeListArray.from_arrays(flattened, dim)
-    idxs_arr = pa.array(idxs, pa.string())
-    return idxs_arr, embeddings_arr
+    ids_arr = pa.array(ids, pa.string())
+    return ids_arr, embeddings_arr
 
 
 def to_chunks(
     dataset: sqlite3.Cursor,
     size: int
 ) -> Generator[tuple[pa.Array, pa.Array], None, None]:
-    idxs_batch: list[str] = []
+    ids_batch: list[str] = []
     embeddings_batch: list[npt.NDArray] = []
-    for idx, embedding in dataset:
-        idxs_batch.append(idx)
+    for id_, embedding in dataset:
+        ids_batch.append(id_)
         embeddings_batch.append(embedding)
 
-        if len(idxs_batch) >= size:
-            yield to_arrays(idxs_batch, embeddings_batch)
-            idxs_batch = []
+        if len(ids_batch) >= size:
+            yield to_arrays(ids_batch, embeddings_batch)
+            ids_batch = []
             embeddings_batch = []
 
-    if idxs_batch:
-        yield to_arrays(idxs_batch, embeddings_batch)
+    if ids_batch:
+        yield to_arrays(ids_batch, embeddings_batch)
 
 
 def open_parquet(path: str | Path, dim: int, bf16: bool) -> pq.ParquetWriter:
-    schema = {"idxs": pa.string()}
+    schema = {"id": pa.string()}
     if bf16:
         # the conversion from bfloat16 to float32 leaves 16 bits of mantissa which are
         # completely zero. Exploit this with byte-stream split and lz4 compression
-        schema["embeddings"] = pa.list_(pa.float32(), dim)
+        schema["embedding"] = pa.list_(pa.float32(), dim)
         writer = pq.ParquetWriter(
             str(path),
             pa.schema(schema),
             compression="lz4",
-            use_byte_stream_split=["embeddings"]  # type: ignore (documented option)
+            use_byte_stream_split=["embedding"]  # type: ignore (documented option)
         )
     else:
         # otherwise, compressing float embeddings isn't worth it
-        schema["embeddings"] = pa.list_(pa.float16(), dim)
+        schema["embedding"] = pa.list_(pa.float16(), dim)
         writer = pq.ParquetWriter(str(path), pa.schema(schema), compression="none")
     return writer
 
 
 def write_to_parquet(
-    idxs_chunk: pa.Array, embd_chunk: pa.Array, writer: pq.ParquetWriter
+    ids_chunk: pa.Array, embd_chunk: pa.Array, writer: pq.ParquetWriter
 ) -> None:
-    batch = pa.table([idxs_chunk, embd_chunk], schema=writer.schema)
-    writer.write_table(batch, row_group_size=len(idxs_chunk))
+    batch = pa.table([ids_chunk, embd_chunk], schema=writer.schema)
+    writer.write_table(batch, row_group_size=len(ids_chunk))
 
 
 def dump_database(
@@ -121,15 +121,15 @@ def dump_database(
         id_ = 0
         counter = 0
         shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
-        for idxs_chunk, embd_chunk in chunks:
-            counter += len(idxs_chunk)
+        for ids_chunk, embd_chunk in chunks:
+            counter += len(ids_chunk)
 
             while counter >= shard_size:
                 excess = counter - shard_size
 
-                cutoff = len(idxs_chunk) - excess
-                write_to_parquet(idxs_chunk[:cutoff], embd_chunk[:cutoff], shard)
-                idxs_chunk = idxs_chunk[cutoff:]
+                cutoff = len(ids_chunk) - excess
+                write_to_parquet(ids_chunk[:cutoff], embd_chunk[:cutoff], shard)
+                ids_chunk = ids_chunk[cutoff:]
                 embd_chunk = embd_chunk[cutoff:]
 
                 id_ += 1
@@ -137,7 +137,7 @@ def dump_database(
                 shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
 
             if counter:
-                write_to_parquet(idxs_chunk, embd_chunk, shard)
+                write_to_parquet(ids_chunk, embd_chunk, shard)
 
 
 def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
@@ -147,7 +147,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
     paths = [str(path) for path in source.glob("*.parquet")]
     dataset: ds.Dataset = ds.dataset(paths)
 
-    embeddings_col_type = dataset.schema.field("embeddings").type
+    embeddings_col_type = dataset.schema.field("embedding").type
     length = embeddings_col_type.list_size  # poorly documented!
     dtype = embeddings_col_type.value_type
     if dtype == pa.float32():
@@ -162,12 +162,12 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
         create_embeddings_table(conn)
         for batch in dataset.to_batches(batch_size=batch_size):
             embeddings_np: npt.NDArray = (
-                batch["embeddings"].flatten().to_numpy().reshape((-1, length))
+                batch["embedding"].flatten().to_numpy().reshape((-1, length))
             )
             embeddings = torch.from_numpy(embeddings_np.copy())  # no read-only memory
             if bf16:
                 embeddings = embeddings.bfloat16()
-            insert_embeddings(batch["idxs"].to_pylist(), embeddings, conn)
+            insert_embeddings(batch["id"].to_pylist(), embeddings, conn)
 
 
 def main() -> int:
