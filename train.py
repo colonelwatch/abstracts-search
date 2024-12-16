@@ -377,7 +377,6 @@ def fill_index(
     trained_index: faiss.Index,
     dataset: Dataset,
     holdout_ids: npt.NDArray | None,
-    cache_dir: Path,
     args: TrainArgs,
     index_filename: str = "index.faiss",
     ivf_filename: str = "index.ivfdata",
@@ -435,7 +434,7 @@ def fill_index(
         
         return to_cpu(on_gpu)
 
-    with TemporaryDirectory(dir=cache_dir) as tmpdir:
+    with TemporaryDirectory(dir=dest) as tmpdir:
         shards = range(0, n_dataset, args.shard_size)
         n_shards = len(shards)
         shards = iunsqueeze(shards)
@@ -596,16 +595,17 @@ def main():
     train_size = TRAIN_SIZE_MULTIPLE * clusters
 
     train, queries = splits(dataset, train_size, args.queries)
-    ground_truth = make_ground_truth(dataset, queries, cache_dir, args)
-
-    train_memmap = create_memmap(train, cache_dir, args)
-
-    faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
+        working_dir = cache_dir if args.use_cache else Path(tmpdir)
+        ground_truth = make_ground_truth(dataset, queries, working_dir, args)
+        train_memmap = create_memmap(train, working_dir, args)
+
+        faiss_index = train_index(train_memmap, factory_string, args.inner_product)
+
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["ids"]  # type: ignore
-        index = fill_index(Path(tmpdir), faiss_index, dataset, q_ids, cache_dir, args)
+        index = fill_index(Path(tmpdir), faiss_index, dataset, q_ids, args)
         optimal_params = tune_index(index, ground_truth, args)
 
     args.dest.mkdir()
@@ -614,7 +614,7 @@ def main():
         save_optimal_params(
             args.dest / "params.json", args.dimensions, args.normalize, optimal_params
         )
-        fill_index(args.dest, faiss_index, dataset, None, cache_dir, args)
+        fill_index(args.dest, faiss_index, dataset, None, args)
     except (KeyboardInterrupt, Exception):
         rmtree(args.dest)
         raise
