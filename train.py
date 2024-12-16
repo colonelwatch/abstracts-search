@@ -523,6 +523,42 @@ def save_optimal_params(
         json.dump(params, f, indent=4)
 
 
+def clean_cache(args: CleanArgs, cache_dir: Path):
+    if cache_dir.exists():
+        rmtree(cache_dir)
+
+    # get cache directory path by following the path to an individual cache file
+    # NOTE: if the cache wasn't created, this will create then delete the cache
+    if args.source is not None and args.source.exists():
+        dataset = load_dataset(args.source)
+        file_0_path = Path(dataset.cache_files[0]["filename"])
+        del dataset
+
+        # parts[0] -> dataset ("parquet" by default)
+        # parts[1] -> cache (pseudorandom, seeded with stuff like file metadata)
+        # since this is a low-level detail, sanity-check the above facts for change
+        file_0_path_rel = file_0_path.relative_to(HF_DATASETS_CACHE)
+        dataset_name = file_0_path_rel.parts[0]
+        cache_name = file_0_path_rel.parts[1]
+        if not (
+            dataset_name == "parquet"
+            and "default-" in cache_name
+        ):
+            print("error: path integrity check failed", file=stderr)
+            return 1
+
+        # remove the cache directory
+        hf_cache_dir = HF_DATASETS_CACHE / dataset_name / cache_name
+        rmtree(hf_cache_dir)
+
+        # remove its associated lock
+        for lock in HF_DATASETS_CACHE.iterdir():
+            if not lock.suffix == ".lock":
+                continue
+            if cache_name in str(lock):
+                lock.unlink()
+
+
 def main():
     cache_dir = get_env_var(
         "ABSTRACTS_SEARCH_CACHE", Path, Path.home() / ".cache/abstracts-search"
@@ -531,41 +567,7 @@ def main():
 
     if args.mode == "clean":
         args = CleanArgs.from_namespace(args)
-
-        if cache_dir.exists():
-            rmtree(cache_dir)
-
-        # get cache directory path by following the path to an individual cache file
-        # NOTE: if the cache wasn't created, this will create then delete the cache
-        if args.source is not None and args.source.exists():
-            dataset = load_dataset(args.source)
-            file_0_path = Path(dataset.cache_files[0]["filename"])
-            del dataset
-
-            # parts[0] -> dataset ("parquet" by default)
-            # parts[1] -> cache (pseudorandom, seeded with stuff like file metadata)
-            # since this is a low-level detail, sanity-check the above facts for change
-            file_0_path_rel = file_0_path.relative_to(HF_DATASETS_CACHE)
-            dataset_name = file_0_path_rel.parts[0]
-            cache_name = file_0_path_rel.parts[1]
-            if not (
-                dataset_name == "parquet"
-                and "default-" in cache_name
-            ):
-                print("error: path integrity check failed", file=stderr)
-                return 1
-
-            # remove the cache directory
-            hf_cache_dir = HF_DATASETS_CACHE / dataset_name / cache_name
-            rmtree(hf_cache_dir)
-
-            # remove its associated lock
-            for lock in HF_DATASETS_CACHE.iterdir():
-                if not lock.suffix == ".lock":
-                    continue
-                if cache_name in str(lock):
-                    lock.unlink()
-
+        clean_cache(args, cache_dir)
         return 0
 
     cache_dir.mkdir(exist_ok=True)
