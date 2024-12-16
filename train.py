@@ -25,6 +25,7 @@ from shutil import rmtree, move
 from sys import stderr
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Generator, Literal, overload, TypedDict
+import warnings
 
 from datasets import Dataset, disable_progress_bars, disable_caching
 from datasets.config import HF_DATASETS_CACHE
@@ -127,8 +128,8 @@ class TrainArgs:
             raise ValueError(f'destination path "{self.dest}" exists')
 
         if self.dimensions is not None and not self.normalize:
-            print("warning: inferring --normalize from --dimension", file=stderr)
             self.normalize = True
+            warnings.warn("inferring --normalize from --dimension")
 
     @property
     def n_tasks(self) -> int:
