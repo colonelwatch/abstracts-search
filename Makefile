@@ -11,8 +11,9 @@ TRAINFLAGS := -w $(WORKING_DIR)
 abstracts-index/index: abstracts-embeddings/data
 	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
 
-abstracts-embeddings/data: update
-	$(PYTHON) ./dump.py $(ENCODEFLAGS) data.sqlite $@
+abstracts-embeddings/data abstracts-embeddings/events &: update
+	$(PYTHON) ./dump.py $(ENCODEFLAGS) data.sqlite abstracts-embeddings/data
+	cp -r events abstracts-embeddings/
 
 include remote_targets.mk
 EQ := =
@@ -62,6 +63,11 @@ remote_targets.mk: FORCE
 	if [[ $$? != 0 ]]; then 						\
 		mv $$tgts $@; 							\
 	fi
+
+.PHONY: recover
+recover:
+	$(PYTHON) ./dump.py $(ENCODEFLAGS) abstracts-embeddings/data data.sqlite
+	cp -r abstracts-embeddings/events ./
 
 .PHONY: clean
 clean:
