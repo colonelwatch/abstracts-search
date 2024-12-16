@@ -204,13 +204,13 @@ def create_memmap(
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
-    def preproc(device: torch.device, x: torch.Tensor) -> torch.Tensor:
+    def preproc(device: torch.device, embeddings: torch.Tensor) -> torch.Tensor:
         if args.dimensions is not None:
-            x = x[:, :args.dimensions]
-        x = x.to(device, non_blocking=True)
+            embeddings = embeddings[:, :args.dimensions]
+        embeddings = embeddings.to(device, non_blocking=True)
         if args.normalize:
-            x = torch.nn.functional.normalize(x)
-        return x.cpu()
+            embeddings = torch.nn.functional.normalize(embeddings)
+        return embeddings.cpu()
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
@@ -251,64 +251,64 @@ def make_ground_truth(
         return Dataset.load_from_disk(cache_path)
 
     with queries.formatted_as("torch", columns=["embeddings", "ids"]):
-        q: torch.Tensor = queries["embeddings"]  # type: ignore
+        q_embeddings: torch.Tensor = queries["embeddings"]  # type: ignore
         q_ids: torch.Tensor = queries["ids"]  # type: ignore
 
         if args.normalize:
-            q = torch.nn.functional.normalize(q)
+            q_embeddings = torch.nn.functional.normalize(q_embeddings)
 
     n_devices = torch.cuda.device_count()
-    q_copy = [q.to(f"cuda:{i}") for i in range(n_devices)]
+    q_embeddings_copy = [q_embeddings.to(f"cuda:{i}") for i in range(n_devices)]
     q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
 
     def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
         return len(ids)
 
     def local_topk(
-        device: torch.device, d_batch_ids: torch.Tensor, d_batch: torch.Tensor
+        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        d_batch = d_batch.to(device, non_blocking=True)
-        d_batch_ids = d_batch_ids.to(device, non_blocking=True)
+        embeddings = embeddings.to(device, non_blocking=True)
+        ids = ids.to(device, non_blocking=True)
 
-        not_in_queries = torch.isin(d_batch_ids, q_ids_copy[device.index], invert=True)
-        d_batch = d_batch[not_in_queries]
-        d_batch_ids = d_batch_ids[not_in_queries]
+        not_in_queries = torch.isin(ids, q_ids_copy[device.index], invert=True)
+        embeddings = embeddings[not_in_queries]
+        ids = ids[not_in_queries]
 
         if args.normalize:
-            d_batch = torch.nn.functional.normalize(d_batch)
+            embeddings = torch.nn.functional.normalize(embeddings)
 
         if args.inner_product:
-            scores_batch = q_copy[device.index] @ d_batch.T
+            scores = q_embeddings_copy[device.index] @ embeddings.T
         else:
             # prefer direct calc over following the quadratic form with matmult
-            scores_batch = torch.cdist(
-                q_copy[device.index],
-                d_batch,
+            scores = torch.cdist(
+                q_embeddings_copy[device.index],
+                embeddings,
                 compute_mode="donot_use_mm_for_euclid_dist"
             )
 
-        top_scores_batch, argtop = torch.topk(
-            scores_batch, args.k, dim=1, largest=args.inner_product
+        top_scores, argtop = torch.topk(
+            scores, args.k, dim=1, largest=args.inner_product
         )
-        top_ids_batch = d_batch_ids[argtop.flatten()].reshape(argtop.shape)
+        top_ids = ids[argtop.flatten()].reshape(argtop.shape)
 
         if n_devices > 1:
-            return top_ids_batch.cpu(), top_scores_batch.cpu()
+            return top_ids.cpu(), top_scores.cpu()
         else:
-            return top_ids_batch, top_scores_batch
+            return top_ids, top_scores
 
     def reduce_topk(
         gt: tuple[torch.Tensor, torch.Tensor],
-        local_top: tuple[torch.Tensor, torch.Tensor],
+        batch_top: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         gt_ids, gt_scores = gt
-        top_ids_batch, top_scores_batch = local_top
+        batch_ids, batch_scores = batch_top
 
-        top_ids_batch = top_ids_batch.cuda(non_blocking=True)
-        top_scores_batch = top_scores_batch.cuda(non_blocking=True)
+        batch_ids = batch_ids.cuda(non_blocking=True)
+        batch_scores = batch_scores.cuda(non_blocking=True)
 
-        gt_scores = torch.hstack((gt_scores, top_scores_batch))
-        gt_ids = torch.hstack((gt_ids, top_ids_batch))
+        gt_scores = torch.hstack((gt_scores, batch_scores))
+        gt_ids = torch.hstack((gt_ids, batch_ids))
         gt_scores, argtop = torch.topk(
             gt_scores, args.k, dim=1, largest=args.inner_product
         )
@@ -316,12 +316,13 @@ def make_ground_truth(
 
         return gt_ids, gt_scores
 
-    n_q, _ = q.shape
-    gt_ids = torch.full((n_q, args.k), -1, dtype=torch.int32).cuda()
+    n_q, _ = q_embeddings.shape
+    shape = (n_q, args.k)
+    gt_ids = torch.full(shape, -1, dtype=torch.int32).cuda()
     if args.inner_product:
-        gt_scores = torch.zeros((n_q, args.k), dtype=torch.float32).cuda()
+        gt_scores = torch.zeros(shape, dtype=torch.float32).cuda()
     else:
-        gt_scores = torch.full((n_q, args.k), torch.inf, dtype=torch.float32).cuda()
+        gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
 
     with tqdm(total=(len(dataset) - len(queries)), disable=(not args.progress)) as c:
         batches = iter_tensors(dataset, args.batch_size)
@@ -337,7 +338,7 @@ def make_ground_truth(
 
     ground_truth = Dataset.from_dict(
         {
-            "embeddings": queries["embeddings"],
+            "embeddings": q_embeddings,
             "gt_ids": gt_ids.numpy().astype(np.int64),
         }
     )
@@ -396,24 +397,22 @@ def fill_index(
         return len(ids)
 
     def preproc(
-        device: torch.device, ids: torch.Tensor, x: torch.Tensor
+        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if args.dimensions is not None:
-            x = x[:, :args.dimensions]
-        x = x.to(device, non_blocking=True)
+            embeddings = embeddings[:, :args.dimensions]
+        embeddings = embeddings.to(device, non_blocking=True)
         if args.normalize:
-            x = torch.nn.functional.normalize(x)
+            embeddings = torch.nn.functional.normalize(embeddings)
         if holdouts is not None:
             ids = ids.to(device, non_blocking=True)
             not_in = torch.isin(ids, holdouts[device.index], invert=True)
             ids = ids[not_in]
-            x = x[not_in]
-        return ids.cpu(), x.cpu()
+            embeddings = embeddings[not_in]
+        return ids.cpu(), embeddings.cpu()
 
     def make_shard_index(device: torch.device, shard_start: int) -> faiss.Index:
-        dev_id = device.index
-
-        on_gpu = to_gpu(trained_index, device=dev_id)
+        on_gpu = to_gpu(trained_index, device=device.index)
         shard = dataset.select(
             range(shard_start, min(shard_start + args.shard_size, len(dataset)))
         )
@@ -423,14 +422,12 @@ def fill_index(
         lengths = imap(batches_copy, get_length, None)
         batches = imap(batches, lambda ids, x: preproc(device, ids, x), None)
         batches = zip(lengths, batches)
-        with (
-            tqdm(
-                total=len(shard), disable=(not args.progress), position=(dev_id + 1)
-            )
-        ) as c:
+        with tqdm(
+            total=len(shard), disable=(not args.progress), position=(device.index + 1)
+        ) as counter:
             for n_batch, (ids, x) in batches:
                 on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
-                c.update(n_batch)
+                counter.update(n_batch)
         
         return to_cpu(on_gpu)
 
