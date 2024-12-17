@@ -238,7 +238,9 @@ def create_memmap(
         batches = iter_tensors(dataset, args.batch_size, embeddings_only=True)
         batches = iunsqueeze(batches)
         batches = imap_multi_gpu(batches, preproc, args.n_tasks)
-        with tqdm(total=len(dataset), disable=(not args.progress)) as counter:
+        with tqdm(
+            desc="create_memmap", total=len(dataset), disable=(not args.progress)
+        ) as counter:
             i = 0
             for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
@@ -345,7 +347,9 @@ def make_ground_truth(
     else:
         gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
 
-    with tqdm(total=len(dataset), disable=(not args.progress)) as counter:
+    with tqdm(
+        desc="make_ground_truth", total=len(dataset), disable=(not args.progress)
+    ) as counter:
         batches = iter_tensors(dataset, args.batch_size)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, None)
@@ -447,7 +451,9 @@ def fill_index(
         n_shards = len(shards)
         shards = iunsqueeze(shards)
         shards = imap_multi_gpu(shards, make_shard_index, args.n_tasks)
-        shards = tqdm(shards, total=n_shards, disable=(not args.progress), position=0)
+        shards = tqdm(
+            shards, desc="fill_index", total=n_shards, disable=(not args.progress)
+        )
 
         shard_paths: list[Path] = []
         for i_shard, shard_index in enumerate(shards):
