@@ -148,7 +148,7 @@ class TrainArgs:
     @property
     def ivf_encoding(self) -> str:
         if match := OPQ_PATTERN.match(self.preprocess):
-            return f"OPQ{match[1]}"
+            return f"PQ{match[1]}"
         else:  # PCAR_PATTERN.match(self.preprocess)
             return "SQ8"
 
