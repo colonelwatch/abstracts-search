@@ -30,6 +30,8 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
+SQLITE_TIMEOUT = 90  # 20 parts takes about 37 seconds on my system
+
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
@@ -163,6 +165,7 @@ def main():
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with sqlite3.connect(
         args.data_path,
+        timeout=SQLITE_TIMEOUT,
         isolation_level="EXCLUSIVE",
         autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
     ) as conn:
