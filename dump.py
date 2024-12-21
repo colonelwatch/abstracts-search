@@ -39,7 +39,7 @@ def parse_args() -> Namespace:
     parser.add_argument("dest", type=Path)
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
-    parser.add_argument("--row-group-size", default=1048576, type=int)  # 1024 * 1024
+    parser.add_argument("--row-group-size", default=262144, type=int)  # around 128MB
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
 
