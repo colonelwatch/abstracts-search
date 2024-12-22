@@ -42,7 +42,7 @@ from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
 OPQ_PATTERN = re.compile(r"OPQ([0-9]+)(?:_([0-9]+))?")
-PCAR_PATTERN = re.compile(r"PCAR([0-9]+)")
+RR_PATTERN = re.compile(r"(?:PCAR|RR)([0-9]+)")  # RR <==> PCAR without the PCA
 VALID_OPQ_WIDTHS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32, 48, 56, 64, 96]
 
 logger = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ class TrainArgs:
                 (match := OPQ_PATTERN.match(self.preprocess)) and
                 int(match[1]) in VALID_OPQ_WIDTHS
             ) or
-            PCAR_PATTERN.match(self.preprocess)
+            RR_PATTERN.match(self.preprocess)
         ):
             raise ValueError(f'preprocess string "{self.preprocess}" is not valid')
 
@@ -149,7 +149,7 @@ class TrainArgs:
     def ivf_encoding(self) -> str:
         if match := OPQ_PATTERN.match(self.preprocess):
             return f"PQ{match[1]}"
-        else:  # PCAR_PATTERN.match(self.preprocess)
+        else:  # RR_PATTERN.match(self.preprocess)
             return "SQ8"
 
     @property
