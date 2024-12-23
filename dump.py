@@ -109,25 +109,30 @@ def dump_database(
     if not (source.suffix == ".sqlite" and dest.suffix == ""):
         raise ValueError("invalid source and dest types")
 
+    # To save RAM, push chunks of row_group_size into shards of shard_size one-by-one
     converter = VectorConverter(bf16)
     sqlite3.register_converter("vector", converter.from_sql_binary)
     with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+        # get the dimension by querying the first row and checking its length
+        embedding = conn.execute("SELECT embedding FROM embeddings LIMIT 1")
+        dim = embedding.fetchone()[0].shape[0]
+
+        # iterate through this massive query in chunks
         cursor = conn.execute("SELECT * FROM embeddings")
         chunks = to_chunks(cursor, row_group_size)
 
-        embedding = conn.execute("SELECT embedding FROM embeddings").fetchone()[0]
-        dim = embedding.shape[0]
-
-        id_ = 0
-        counter = 0
+        id_ = 0  # shard id
+        counter = 0  # the number of rows the current shard will have
         shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
         for ids_chunk, embd_chunk in chunks:
+            # start by assuming this shard will get the whole chunk
             counter += len(ids_chunk)
 
+            # open new shard(s) and write so that the remainder fits in one shard
             while counter >= shard_size:
                 excess = counter - shard_size
 
-                cutoff = len(ids_chunk) - excess
+                cutoff = len(ids_chunk) - excess  # != shard_size perhaps only at first
                 write_to_parquet(ids_chunk[:cutoff], embd_chunk[:cutoff], shard)
                 ids_chunk = ids_chunk[cutoff:]
                 embd_chunk = embd_chunk[cutoff:]
@@ -136,7 +141,7 @@ def dump_database(
                 counter = excess
                 shard = open_parquet(dest / f"data_{id_:03}.parquet", dim, bf16)
 
-            if counter:
+            if counter:  # if counter didn't happen to be a multiple of shard_size
                 write_to_parquet(ids_chunk, embd_chunk, shard)
 
 
@@ -151,7 +156,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
     length = embeddings_col_type.list_size  # poorly documented!
     dtype = embeddings_col_type.value_type
     if dtype == pa.float32():
-        bf16 = True
+        bf16 = True  # assume this was converted from bfloat16, otherwise this truncates
     elif dtype == pa.float16():
         bf16 = False
     else:
@@ -161,7 +166,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
     with sqlite3.connect(dest) as conn:
         create_embeddings_table(conn)
         for batch in dataset.to_batches(batch_size=batch_size):
-            embeddings_np: npt.NDArray = (
+            embeddings_np: npt.NDArray = (  # this makes the conversion zero-copy
                 batch["embedding"].flatten().to_numpy().reshape((-1, length))
             )
             embeddings = torch.from_numpy(embeddings_np.copy())  # no read-only memory

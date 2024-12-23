@@ -79,15 +79,15 @@ def parse_args() -> Namespace:
     train.add_argument("-N", "--normalize", action="store_true")
     train.add_argument("-I", "--inner-product", action="store_true")
     train.add_argument("-p", "--preprocess", default="OPQ96_384")
-    train.add_argument("-k", "--intersection", default=None, type=int)
-    train.add_argument("-c", "--clusters", default=None, type=int)  # TODO: raise
+    train.add_argument("-k", "--intersection", default=None, type=int)  # 1R@1 else kR@k
+    train.add_argument("-c", "--clusters", default=None, type=int)
     train.add_argument("-q", "--queries", default=16384, type=int)
     train.add_argument("-t", "--tasks", default=None, type=int)
     train.add_argument("-P", "--progress", action="store_true")
-    train.add_argument("--truncate", default=None, type=int)
+    train.add_argument("--truncate", default=None, type=int)  # for experiments only
     train.add_argument("--batch-size", default=1024, type=int)
-    train.add_argument("--shard-size", default=4194304, type=int)
-    train.add_argument("--use-cache", action="store_true")
+    train.add_argument("--shard-size", default=4194304, type=int)  # before index merge
+    train.add_argument("--use-cache", action="store_true")  # for experiments only
 
     return parser.parse_args()
 
@@ -168,7 +168,7 @@ class TrainArgs:
 def load_dataset(dir: Path) -> Dataset:
     paths = [str(path) for path in dir.glob("*.parquet")]
     dataset: Dataset = Dataset.from_parquet(paths)  # type: ignore
-    ids = np.arange(len(dataset), dtype=np.int32)
+    ids = np.arange(len(dataset), dtype=np.int32)  # add unique integer IDs for later
     return dataset.add_column("index", ids)  # type: ignore  (wrong func signature)
 
 
@@ -225,6 +225,7 @@ def create_memmap(
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
+    # truncates dimension on CPU and normalizes on GPU
     def preproc(device: torch.device, embeddings: torch.Tensor) -> torch.Tensor:
         if args.dimensions is not None:
             embeddings = embeddings[:, :args.dimensions]
@@ -241,7 +242,7 @@ def create_memmap(
         with tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
         ) as counter:
-            i = 0
+            i = 0  # save batches to disk by assigning to memmap slices
             for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
                 memmap[i:(i + n_batch)] = embeddings_batch.numpy()
@@ -251,6 +252,7 @@ def create_memmap(
         cache_path.unlink()
         raise
 
+    # flush from RAM to disk, then destroy the object on RAM and recreate from disk
     memmap.flush()
     return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
@@ -280,6 +282,7 @@ def make_ground_truth(
         if args.normalize:
             q_embeddings = torch.nn.functional.normalize(q_embeddings)
 
+    # make available a local copy to each GPU
     n_devices = torch.cuda.device_count()
     q_embeddings_copy = [q_embeddings.to(f"cuda:{i}") for i in range(n_devices)]
     q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
@@ -290,9 +293,11 @@ def make_ground_truth(
     def local_topk(
         device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # send to GPU asynchronously
         embeddings = embeddings.to(device, non_blocking=True)
         ids = ids.to(device, non_blocking=True)
 
+        # don't consider the queries themselves as possible ground truth
         not_in_queries = torch.isin(ids, q_ids_copy[device.index], invert=True)
         embeddings = embeddings[not_in_queries]
         ids = ids[not_in_queries]
@@ -301,6 +306,7 @@ def make_ground_truth(
             embeddings = torch.nn.functional.normalize(embeddings)
 
         if args.inner_product:
+            # becomes a matmult for multiple data
             scores = q_embeddings_copy[device.index] @ embeddings.T
         else:
             # prefer direct calc over following the quadratic form with matmult
@@ -310,15 +316,16 @@ def make_ground_truth(
                 compute_mode="donot_use_mm_for_euclid_dist"
             )
 
+        # only yield k from this batch, in the extreme this k replaces all running k
         top_scores, argtop = torch.topk(
-            scores, args.k, dim=1, largest=args.inner_product
+            scores, args.k, dim=1, largest=args.inner_product  # min L2 or max IP
         )
         top_ids = ids[argtop.flatten()].reshape(argtop.shape)
 
         if n_devices > 1:
             return top_ids.cpu(), top_scores.cpu()
         else:
-            return top_ids, top_scores
+            return top_ids, top_scores  # reduce step is on this GPU
 
     def reduce_topk(
         gt: tuple[torch.Tensor, torch.Tensor],
@@ -330,6 +337,7 @@ def make_ground_truth(
         batch_ids = batch_ids.cuda(non_blocking=True)
         batch_scores = batch_scores.cuda(non_blocking=True)
 
+        # update the top k for each query
         gt_scores = torch.hstack((gt_scores, batch_scores))
         gt_ids = torch.hstack((gt_ids, batch_ids))
         gt_scores, argtop = torch.topk(
@@ -339,6 +347,7 @@ def make_ground_truth(
 
         return gt_ids, gt_scores
 
+    # initialize the top k
     n_q, _ = q_embeddings.shape
     shape = (n_q, args.k)
     gt_ids = torch.full(shape, -1, dtype=torch.int32).cuda()
@@ -364,7 +373,7 @@ def make_ground_truth(
     ground_truth = Dataset.from_dict(
         {
             "embedding": q_embeddings,
-            "gt_ids": gt_ids.numpy().astype(np.int64),
+            "gt_ids": gt_ids.numpy().astype(np.int64),  # faiss expects int64
         }
     )
     ground_truth.save_to_disk(cache_path)
@@ -407,6 +416,7 @@ def fill_index(
     index_filename: str = "index.faiss",
     ivf_filename: str = "index.ivfdata",
 ) -> faiss.Index:
+    # Determine n_dataset and holdouts
     if holdout_ids is not None:
         holdouts_cpu = torch.from_numpy(holdout_ids)
         holdouts = [
@@ -418,6 +428,7 @@ def fill_index(
         holdouts = None
         n_dataset = len(dataset)
 
+    # truncates dimension on CPU, normalizes on GPU, and also drops holdouts
     def preproc(
         device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -433,9 +444,10 @@ def fill_index(
             embeddings = embeddings[not_in]
         return ids.cpu(), embeddings.cpu()
 
+    # itself runs in parallel with other calls, so operates single-threaded
     def make_shard_index(device: torch.device, shard_start: int) -> faiss.Index:
         on_gpu = to_gpu(trained_index, device=device.index)
-        shard = dataset.select(
+        shard = dataset.select(  # yields another Datset not rows
             range(shard_start, min(shard_start + args.shard_size, len(dataset)))
         )
 
@@ -455,12 +467,15 @@ def fill_index(
             shards, desc="fill_index", total=n_shards, disable=(not args.progress)
         )
 
+        # write shards to disk because holding them all in RAM causes SIGKILL (16 +
+        # 16 swap on my machine!)
         shard_paths: list[Path] = []
         for i_shard, shard_index in enumerate(shards):
             path = Path(tmpdir) / f"index_{i_shard:03d}.faiss'"
             faiss.write_index(shard_index, str(path))
             shard_paths.append(path)
 
+        # use the `merge_on_disk` routine
         index_path = dest / index_filename
         ivf_path = dest / ivf_filename
         temp_ivf_path = Path(ivf_filename)
@@ -509,7 +524,7 @@ def tune_index(
     optimal_params: list[IndexParameters] = []
     for i in range(pareto_vector.size()):
         point: faiss.OperatingPoint = pareto_vector.at(i)
-        params = IndexParameters(
+        params = IndexParameters(  # converts from ms to seconds
             recall=point.perf, exec_time=(0.001 * point.t), param_string=point.key
         )
         optimal_params.append(params)
@@ -518,6 +533,7 @@ def tune_index(
 
 
 def save_ids(path: Path, dataset: Dataset, batch_size: int):
+    # the columns themselves aren't needed to run the index
     dataset.remove_columns("embedding").to_parquet(path, batch_size, compression="lz4")
 
 
@@ -593,7 +609,7 @@ def main():
 
     # run through global huggingface datasets settings
     if not args.use_cache:
-        disable_caching()  # caching is good for experimention, not otherwise
+        disable_caching()
     if not args.progress:
         disable_progress_bars()
 
