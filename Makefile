@@ -1,18 +1,16 @@
 SHELL := bash  # TODO: lift this requirement?
 PYTHON := conda run -n abstracts-search --live-stream python
 
-WORKING_DIR := splits
-
 CFLAGS := -O2
 BUILDFLAGS :=
-ENCODEFLAGS :=
-TRAINFLAGS := -w $(WORKING_DIR)
+DUMPFLAGS :=
+TRAINFLAGS :=
 
 abstracts-index/index: abstracts-embeddings/data
 	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
 
 abstracts-embeddings/data abstracts-embeddings/events &: update
-	$(PYTHON) ./dump.py $(ENCODEFLAGS) data.sqlite abstracts-embeddings/data
+	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite abstracts-embeddings/data
 	cp -r events abstracts-embeddings/
 
 include remote_targets.mk
@@ -66,7 +64,7 @@ remote_targets.mk: FORCE
 
 .PHONY: recover
 recover:
-	$(PYTHON) ./dump.py $(ENCODEFLAGS) abstracts-embeddings/data data.sqlite
+	$(PYTHON) ./dump.py $(DUMPFLAGS) abstracts-embeddings/data data.sqlite
 	cp -r abstracts-embeddings/events ./
 
 .PHONY: clean
