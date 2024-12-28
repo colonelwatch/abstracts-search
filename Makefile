@@ -27,7 +27,7 @@ events/updated_date$(EQ)% : oa_jsonl | data.sqlite events
 	aws s3 ls --no-sign-request "$$d/" | 					\
 		sed -E "s|.* +(.*)|$$d/\1|" | 					\
 		xargs -I % -- aws s3 cp --no-sign-request % - | 		\
-		gunzip | ./oa_jsonl | mbuffer -q -t -m 10G | 			\
+		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 			\
 		$(PYTHON) ./build.py $(BUILDFLAGS) data.sqlite
 	touch $@
 
