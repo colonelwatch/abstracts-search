@@ -15,7 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
 import logging
@@ -121,6 +121,12 @@ class TrainArgs:
     shard_size: int
     use_cache: bool
 
+    # not args
+    ivf_encoding: str = field(init=False, compare=False)
+    one_recall_at_one: bool = field(init=False, compare=False)
+    k: int = field(init=False, compare=False)
+    n_tasks: int = field(init=False, compare=False)
+
     @classmethod
     def from_namespace(cls, namespace: Namespace):
         return cls(**vars(namespace))
@@ -145,24 +151,26 @@ class TrainArgs:
         ):
             raise ValueError(f'preprocess string "{self.preprocess}" is not valid')
 
-    @property
-    def ivf_encoding(self) -> str:
         if match := OPQ_PATTERN.match(self.preprocess):
-            return f"PQ{match[1]}"
+            self.ivf_encoding = f"PQ{match[1]}"
         else:  # RR_PATTERN.match(self.preprocess)
-            return "SQ8"
+            self.ivf_encoding = "SQ8"
 
-    @property
-    def one_recall_at_one(self) -> bool:
-        return self.intersection is None
+        self.one_recall_at_one = (self.intersection is None)
+        self.k = 1 if self.intersection is None else self.intersection
 
-    @property
-    def k(self) -> int:
-        return 1 if self.intersection is None else self.intersection
-
-    @property
-    def n_tasks(self) -> int:
-        return torch.cuda.device_count() + 2 if self.tasks is None else self.tasks
+        if not torch.cuda.is_available():
+            raise ValueError("failed to find a NVIDIA GPU")
+        n_gpus = torch.cuda.device_count()
+        if self.tasks is None:
+            self.n_tasks = n_gpus + 2
+        else:
+            self.n_tasks = self.tasks
+            if self.tasks < n_gpus:
+                warnings.warn(
+                    '"--tasks" set under the number of available GPUs, '
+                    'will use no more than "--tasks" GPUs'
+                )
 
 
 def load_dataset(dir: Path) -> Dataset:

@@ -118,6 +118,7 @@ def imap_multi_gpu[T](  # noqa: E302
         data_out = func(device, *data_in)
         return data_out
 
-    devices = cycle(torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count()))
+    n_gpus = min(n_tasks, torch.cuda.device_count())
+    devices = cycle(torch.device(f"cuda:{i}") for i in range(n_gpus))
     for data_out in imap(zip(devices, inputs), func_with_gpu, n_tasks):
         yield data_out
