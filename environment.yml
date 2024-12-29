@@ -18,7 +18,7 @@ dependencies:
   - cuda-runtime=12.4.1=0
   - cuda-version=12.6=3
   - expat=2.6.3=h6a678d5_0
-  - faiss-gpu=1.9.0=py3.12_ha2e4562_0_cuda12.1.1
+  - faiss-gpu=1.8.0=py3.12_h4c7d538_0_cuda12.1.1
   - filelock=3.13.1=py312h06a4308_0
   - intel-openmp=2023.1.0=hdb19cb5_46306
   - jinja2=3.1.4=py312h06a4308_0
@@ -29,7 +29,7 @@ dependencies:
   - libcurand=10.3.7.77=0
   - libcusolver=11.6.1.9=0
   - libcusparse=12.3.1.170=0
-  - libfaiss=1.9.0=h4818125_0_cuda12.1.1
+  - libfaiss=1.8.0=h046e95b_0_cuda12.1.1
   - libffi=3.4.4=h6a678d5_1
   - libgcc-ng=11.2.0=h1234567_1
   - libgomp=11.2.0=h1234567_1
