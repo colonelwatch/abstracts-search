@@ -163,7 +163,7 @@ class TrainArgs:
             raise ValueError("failed to find a NVIDIA GPU")
         n_gpus = torch.cuda.device_count()
         if self.tasks is None:
-            self.n_tasks = n_gpus + 2
+            self.n_tasks = n_gpus
         else:
             self.n_tasks = self.tasks
             if self.tasks < n_gpus:
