@@ -188,29 +188,25 @@ def hash(parameters: list) -> str:
 
 @overload
 def iter_tensors(
-    dataset: Dataset, batch_size: int, embeddings_only: Literal[False] = False
+    dataset: Dataset, batch_size: int, format: Literal["torch"] = "torch",
 ) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
     ...
 
 @overload  # noqa: E302
 def iter_tensors(
-    dataset: Dataset, batch_size: int, embeddings_only: Literal[True]
-) -> Generator[torch.Tensor, None, None]:
+    dataset: Dataset, batch_size: int, format: Literal["numpy"],
+) -> (
+    Generator[tuple[npt.NDArray[np.int32], npt.NDArray[np.float16]], None, None] |
+    Generator[tuple[npt.NDArray[np.int32], npt.NDArray[np.float32]], None, None]
+):
     ...
 
 def iter_tensors(  # noqa: E302
-    dataset: Dataset, batch_size: int, embeddings_only: bool = False
-) -> (
-    Generator[tuple[torch.Tensor, torch.Tensor], None, None] |
-    Generator[torch.Tensor, None, None]
-):
-    columns = ["embedding"] if embeddings_only else ["index", "embedding"]
-    with dataset.formatted_as("torch", columns=columns):
+    dataset: Dataset, batch_size: int, format: Literal["torch", "numpy"] = "torch",
+) -> Generator[tuple, None, None]:
+    with dataset.formatted_as(format, columns=["index", "embedding"]):
         for batch in dataset.iter(batch_size):
-            if embeddings_only:
-                yield batch["embedding"]  # type: ignore
-            else:
-                yield batch["index"], batch["embedding"]  # type: ignore
+            yield batch["index"], batch["embedding"]  # type: ignore
 
 
 def create_memmap(
@@ -225,27 +221,28 @@ def create_memmap(
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
-    # truncates dimension on CPU and normalizes on GPU
-    def preproc(device: torch.device, embeddings: torch.Tensor) -> torch.Tensor:
+    # normalize on CPU, mutating the input
+    def preproc[T_co: np.floating](
+        _, embeddings: npt.NDArray[T_co]
+    ) -> npt.NDArray[T_co]:
         if args.dimensions is not None:
             embeddings = embeddings[:, :args.dimensions]
-        embeddings = embeddings.to(device, non_blocking=True)
         if args.normalize:
-            embeddings = torch.nn.functional.normalize(embeddings)
-        return embeddings.cpu()
+            lengths = np.linalg.norm(embeddings, ord=2, axis=1)
+            embeddings /= lengths[:, np.newaxis]
+        return embeddings
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        batches = iter_tensors(dataset, args.batch_size, embeddings_only=True)
-        batches = iunsqueeze(batches)
-        batches = imap_multi_gpu(batches, preproc, args.n_tasks)
+        batches = iter_tensors(dataset, args.batch_size, "numpy")
+        batches = imap(batches, preproc, args.n_tasks)
         with tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
         ) as counter:
             i = 0  # save batches to disk by assigning to memmap slices
             for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
-                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
+                memmap[i:(i + n_batch)] = embeddings_batch
                 i += n_batch
                 counter.update(n_batch)
     except (KeyboardInterrupt, Exception):
@@ -428,31 +425,32 @@ def fill_index(
         holdouts = None
         n_dataset = len(dataset)
 
-    # truncates dimension on CPU, normalizes on GPU, and also drops holdouts
-    def preproc(
-        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if args.dimensions is not None:
-            embeddings = embeddings[:, :args.dimensions]
-        embeddings = embeddings.to(device, non_blocking=True)
-        if args.normalize:
-            embeddings = torch.nn.functional.normalize(embeddings)
-        if holdouts is not None:
-            ids = ids.to(device, non_blocking=True)
-            not_in = torch.isin(ids, holdouts[device.index], invert=True)
-            ids = ids[not_in]
-            embeddings = embeddings[not_in]
-        return ids.cpu(), embeddings.cpu()
-
     # itself runs in parallel with other calls, so operates single-threaded
     def make_shard_index(device: torch.device, shard_start: int) -> faiss.Index:
+
+        # truncates dimension on CPU, normalizes on GPU, and also drops holdouts
+        def preproc(
+            ids: torch.Tensor, embeddings: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if args.dimensions is not None:
+                embeddings = embeddings[:, :args.dimensions]
+            embeddings = embeddings.to(device, non_blocking=True)
+            if args.normalize:
+                embeddings = torch.nn.functional.normalize(embeddings)
+            if holdouts is not None:
+                ids = ids.to(device, non_blocking=True)
+                not_in = torch.isin(ids, holdouts[device.index], invert=True)
+                ids = ids[not_in]
+                embeddings = embeddings[not_in]
+            return ids.cpu(), embeddings.cpu()
+
         on_gpu = to_gpu(trained_index, device=device.index)
         shard = dataset.select(  # yields another Datset not rows
             range(shard_start, min(shard_start + args.shard_size, len(dataset)))
         )
 
         batches = iter_tensors(shard, args.batch_size)
-        batches = imap(batches, lambda ids, x: preproc(device, ids, x), None)
+        batches = imap(batches, preproc, None)
         for ids, x in batches:
             on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
         
