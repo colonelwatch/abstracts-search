@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
@@ -86,7 +87,7 @@ def parse_args() -> Namespace:
     train.add_argument("-P", "--progress", action="store_true")
     train.add_argument("--truncate", default=None, type=int)  # for experiments only
     train.add_argument("--batch-size", default=1024, type=int)
-    train.add_argument("--shard-size", default=4194304, type=int)  # before index merge
+    train.add_argument("--shard-size", default=33554432, type=int)  # under 4GB
     train.add_argument("--use-cache", action="store_true")  # for experiments only
 
     return parser.parse_args()
@@ -412,15 +413,13 @@ def train_index(
     return index
 
 
-def fill_index(
-    dest: Path,
+def make_index_shards(
+    dir: Path,
     trained_index: faiss.Index,
     dataset: Dataset,
     holdout_ids: npt.NDArray | None,
     args: TrainArgs,
-    index_filename: str = "index.faiss",
-    ivf_filename: str = "index.ivfdata",
-) -> faiss.Index:
+) -> None:
     # Determine n_dataset and holdouts
     if holdout_ids is not None:
         holdouts_cpu = torch.from_numpy(holdout_ids)
@@ -434,7 +433,7 @@ def fill_index(
         n_dataset = len(dataset)
 
     # itself runs in parallel with other calls, so operates single-threaded
-    def make_shard_index(device: torch.device, shard_start: int) -> faiss.Index:
+    def make_shard(device: torch.device, shard_start: int) -> faiss.Index:
 
         # truncates dimension on CPU, normalizes on GPU, and also drops holdouts
         def preproc(
@@ -461,42 +460,41 @@ def fill_index(
         batches = imap(batches, preproc, None)
         for ids, x in batches:
             on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
-        
+
         return to_cpu(on_gpu)
 
-    with TemporaryDirectory(dir=dest) as tmpdir:
+    # write shards to disk so that file sizes stay under 4GB but also because
+    # holding them all in RAM causes OOM-kill (on my machine with 16GB + 16GB swap!)
+    dir.mkdir()
+    try:
+        empty_path = dir / "empty.faiss"
+        faiss.write_index(trained_index, str(empty_path))
+
         shards = range(0, n_dataset, args.shard_size)
         n_shards = len(shards)
         shards = iunsqueeze(shards)
-        shards = imap_multi_gpu(shards, make_shard_index, args.n_tasks)
+        shards = imap_multi_gpu(shards, make_shard, args.n_tasks)
         shards = tqdm(
             shards, desc="fill_index", total=n_shards, disable=(not args.progress)
         )
+        for i_shard, shard in enumerate(shards):
+            path = dir / f"shard_{i_shard:03d}.faiss"
+            faiss.write_index(shard, str(path))
+    except (KeyboardInterrupt, Exception):
+        rmtree(dir)
+        raise
 
-        # write shards to disk because holding them all in RAM causes SIGKILL (16 +
-        # 16 swap on my machine!)
-        shard_paths: list[Path] = []
-        for i_shard, shard_index in enumerate(shards):
-            path = Path(tmpdir) / f"index_{i_shard:03d}.faiss'"
-            faiss.write_index(shard_index, str(path))
-            shard_paths.append(path)
 
-        # use the `merge_on_disk` routine
-        index_path = dest / index_filename
-        ivf_path = dest / ivf_filename
-        temp_ivf_path = Path(ivf_filename)
-        try:
-            index = faiss.clone_index(trained_index)
-            merge_ondisk(index, [str(p) for p in shard_paths], str(temp_ivf_path))
-            move(temp_ivf_path, ivf_path)
-            faiss.write_index(index, str(index_path))
-        except (KeyboardInterrupt, Exception):
-            index_path.unlink(missing_ok=True)
-            ivf_path.unlink(missing_ok=True)
-            temp_ivf_path.unlink(missing_ok=True)
-            raise
-
-    return index
+@contextmanager
+def merged(dir: Path) -> Generator[faiss.Index, None, None]:
+    empty_path = dir / "empty.faiss"
+    shard_paths = [str(p) for p in dir.glob("shard_*.faiss")]
+    index = faiss.read_index(str(empty_path))
+    try:
+        merge_ondisk(index, shard_paths, "temp.ivfdata")
+        yield index
+    finally:
+        Path("temp.ivfdata").unlink(missing_ok=True)
 
 
 def tune_index(
@@ -639,10 +637,12 @@ def main():
 
         faiss_index = train_index(train_memmap, factory_string, args.inner_product)
 
+        shards_dir = Path(tmpdir) / "shards"
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["index"]  # type: ignore
-        index = fill_index(Path(tmpdir), faiss_index, dataset, q_ids, args)
-        optimal_params = tune_index(index, ground_truth, args)
+        make_index_shards(shards_dir, faiss_index, dataset, q_ids, args)
+        with merged(shards_dir) as merged_index:
+            optimal_params = tune_index(merged_index, ground_truth, args)
 
     args.dest.mkdir()
     try:
@@ -650,7 +650,7 @@ def main():
         save_optimal_params(
             args.dest / "params.json", args.dimensions, args.normalize, optimal_params
         )
-        fill_index(args.dest, faiss_index, dataset, None, args)
+        make_index_shards(args.dest / "shards", faiss_index, dataset, None, args)
     except (KeyboardInterrupt, Exception):
         rmtree(args.dest)
         raise
