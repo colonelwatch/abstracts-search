@@ -9,14 +9,11 @@ TRAINFLAGS :=
 abstracts-index/index: abstracts-embeddings/data
 	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
 
-abstracts-embeddings/data abstracts-embeddings/events &: update
-	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite abstracts-embeddings/data
-	cp -r events abstracts-embeddings/
-
 include remote_targets.mk
 EQ := =
-.PHONY: update
-update: | $(events)
+abstracts-embeddings/data abstracts-embeddings/events &: | $(events)
+	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite abstracts-embeddings/data
+	cp -r events abstracts-embeddings/
 
 # in theory, wouldn't I need to handle two objects in one line here? I could probably
 # update oa_jsonl to handle that?
