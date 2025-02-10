@@ -82,7 +82,7 @@ def parse_args() -> Namespace:
     train.add_argument("-p", "--preprocess", default="OPQ96_384")
     train.add_argument("-k", "--intersection", default=None, type=int)  # 1R@1 else kR@k
     train.add_argument("-c", "--clusters", default=None, type=int)
-    train.add_argument("-q", "--queries", default=16384, type=int)
+    train.add_argument("-q", "--queries", default=8192, type=int)
     train.add_argument("-t", "--tasks", default=None, type=int)
     train.add_argument("-P", "--progress", action="store_true")
     train.add_argument("--truncate", default=None, type=int)  # for experiments only
