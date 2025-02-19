@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
@@ -39,7 +40,7 @@ import numpy.typing as npt
 import torch
 from tqdm import tqdm
 
-from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
+from utils.gpu_utils import imap, imap_multi_gpu
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
 OPQ_PATTERN = re.compile(r"OPQ([0-9]+)(?:_([0-9]+))?")
@@ -383,48 +384,26 @@ def make_index_shards(
     holdout_ids: npt.NDArray | None,
     args: TrainArgs,
 ) -> None:
-    # Determine n_dataset and holdouts
+    # Determine n_dataset and holdouts (and copy them to GPUs)
     if holdout_ids is not None:
-        holdouts_cpu = torch.from_numpy(holdout_ids)
-        holdouts = [
-            holdouts_cpu.to(f"cuda:{i}")
-            for i in range(torch.cuda.device_count())
-        ]
+        holdouts = torch.from_numpy(holdout_ids)
         n_dataset = len(dataset) - len(holdout_ids)
     else:
         holdouts = None
         n_dataset = len(dataset)
 
-    # itself runs in parallel with other calls, so operates single-threaded
-    def make_shard(device: torch.device, shard_start: int) -> faiss.Index:
-
-        # truncates dimension on CPU, normalizes on GPU, and also drops holdouts
-        def preproc(
-            ids: torch.Tensor, embeddings: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            if args.dimensions is not None:
-                embeddings = embeddings[:, :args.dimensions]
-            embeddings = embeddings.to(device, non_blocking=True)
-            if args.normalize:
-                embeddings = torch.nn.functional.normalize(embeddings)
-            if holdouts is not None:
-                ids = ids.to(device, non_blocking=True)
-                not_in = torch.isin(ids, holdouts[device.index], invert=True)
-                ids = ids[not_in]
-                embeddings = embeddings[not_in]
-            return ids.cpu(), embeddings.cpu()
-
-        on_gpu = to_gpu(trained_index, device=device.index)
-        shard = dataset.select(  # yields another Datset not rows
-            range(shard_start, min(shard_start + args.shard_size, len(dataset)))
-        )
-
-        batches = iter_tensors(shard, args.batch_size)
-        batches = imap(batches, preproc, 0)
-        for ids, x in batches:
-            on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
-
-        return to_cpu(on_gpu)
+    def preproc(
+        ids: torch.Tensor, embeddings: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if holdouts is not None:
+            not_in = torch.isin(ids, holdouts, invert=True)
+            ids = ids[not_in]
+            embeddings = embeddings[not_in]
+        if args.dimensions is not None:
+            embeddings = embeddings[:, :args.dimensions]
+        if args.normalize:
+            embeddings = torch.nn.functional.normalize(embeddings)
+        return ids, embeddings
 
     # write shards to disk so that file sizes stay under 4GB but also because
     # holding them all in RAM causes OOM-kill (on my machine with 16GB + 16GB swap!)
@@ -433,16 +412,30 @@ def make_index_shards(
         empty_path = dir / "empty.faiss"
         faiss.write_index(trained_index, str(empty_path))
 
-        shards = range(0, n_dataset, args.shard_size)
-        n_shards = len(shards)
-        shards = iunsqueeze(shards)
-        shards = imap_multi_gpu(shards, make_shard)
-        shards = tqdm(
-            shards, desc="fill_index", total=n_shards, disable=(not args.progress)
+        # copy trained index to GPUs
+        on_gpus: deque[faiss.Index] = deque(
+            to_gpu(trained_index) for _ in range(torch.cuda.device_count())
         )
-        for i_shard, shard in enumerate(shards):
-            path = dir / f"shard_{i_shard:03d}.faiss"
-            faiss.write_index(shard, str(path))
+
+        with tqdm(desc="fill_index", total=n_dataset, disable=(not args.progress)) as c:
+            for i_shard, row_start in enumerate(range(0, n_dataset, args.shard_size)):
+                shard = dataset.select(  # yields another Datset not rows
+                    range(row_start, min(row_start + args.shard_size, len(dataset)))
+                )
+
+                batches = iter_tensors(shard, args.batch_size)
+                batches = imap(batches, preproc, -1)
+                for ids, embds in batches:
+                    on_gpus[0].add_with_ids(embds.numpy(), ids.numpy())  # type: ignore
+                    on_gpus.rotate(-1)
+                    c.update(len(ids))
+
+                index: faiss.Index = faiss.clone_index(trained_index)
+                for on_gpu in on_gpus:
+                    index.merge_from(to_cpu(on_gpu))
+                    on_gpu.reset()
+                faiss.write_index(index, str(dir / f"shard_{i_shard:03d}.faiss"))
+                del index
     except (KeyboardInterrupt, Exception):
         rmtree(dir)
         raise
