@@ -412,10 +412,11 @@ def make_index_shards(
         empty_path = dir / "empty.faiss"
         faiss.write_index(trained_index, str(empty_path))
 
-        # copy trained index to GPUs
+        # copy trained index
         on_gpus: deque[faiss.Index] = deque(
             to_gpu(trained_index) for _ in range(torch.cuda.device_count())
         )
+        index: faiss.Index = faiss.clone_index(trained_index)
 
         with tqdm(desc="fill_index", total=n_dataset, disable=(not args.progress)) as c:
             for i_shard, row_start in enumerate(range(0, n_dataset, args.shard_size)):
@@ -430,12 +431,11 @@ def make_index_shards(
                     on_gpus.rotate(-1)
                     c.update(len(ids))
 
-                index: faiss.Index = faiss.clone_index(trained_index)
                 for on_gpu in on_gpus:
                     index.merge_from(to_cpu(on_gpu))
                     on_gpu.reset()
                 faiss.write_index(index, str(dir / f"shard_{i_shard:03d}.faiss"))
-                del index
+                index.reset()
     except (KeyboardInterrupt, Exception):
         rmtree(dir)
         raise
