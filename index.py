@@ -26,7 +26,7 @@ from pathlib import Path
 from shutil import rmtree
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Generator, Literal, overload, TypedDict
+from typing import Any, Callable, Generator, Literal, TypedDict
 import warnings
 
 from datasets import Dataset, disable_progress_bars, disable_caching
@@ -177,25 +177,10 @@ def hash(parameters: list) -> str:
     return h.hexdigest()
 
 
-@overload
-def iter_tensors(
-    dataset: Dataset, batch_size: int, format: Literal["torch"] = "torch",
-) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
-    ...
-
-@overload  # noqa: E302
-def iter_tensors(
-    dataset: Dataset, batch_size: int, format: Literal["numpy"],
-) -> (
-    Generator[tuple[npt.NDArray[np.int32], npt.NDArray[np.float16]], None, None] |
-    Generator[tuple[npt.NDArray[np.int32], npt.NDArray[np.float32]], None, None]
-):
-    ...
-
 def iter_tensors(  # noqa: E302
-    dataset: Dataset, batch_size: int, format: Literal["torch", "numpy"] = "torch",
-) -> Generator[tuple, None, None]:
-    with dataset.formatted_as(format, columns=["index", "embedding"]):
+    dataset: Dataset, batch_size: int
+) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
+    with dataset.formatted_as("torch", columns=["index", "embedding"]):
         for batch in dataset.iter(batch_size):
             yield batch["index"], batch["embedding"]  # type: ignore
 
@@ -212,20 +197,16 @@ def create_memmap(
     if cache_path.exists():
         return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
-    # normalize on CPU, mutating the input
-    def preproc[T_co: np.floating](
-        _, embeddings: npt.NDArray[T_co]
-    ) -> npt.NDArray[T_co]:
+    def preproc(_, embeddings: torch.Tensor) -> torch.Tensor:
         if args.dimensions is not None:
             embeddings = embeddings[:, :args.dimensions]
         if args.normalize:
-            lengths = np.linalg.norm(embeddings, ord=2, axis=1)
-            embeddings /= lengths[:, np.newaxis]
+            embeddings = torch.nn.functional.normalize(embeddings)
         return embeddings
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        batches = iter_tensors(dataset, args.batch_size, "numpy")
+        batches = iter_tensors(dataset, args.batch_size)
         batches = imap(batches, preproc, -1)
         with tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
@@ -233,7 +214,7 @@ def create_memmap(
             i = 0  # save batches to disk by assigning to memmap slices
             for embeddings_batch in batches:
                 n_batch = len(embeddings_batch)
-                memmap[i:(i + n_batch)] = embeddings_batch
+                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
                 i += n_batch
                 counter.update(n_batch)
     except (KeyboardInterrupt, Exception):
