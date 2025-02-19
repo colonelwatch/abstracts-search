@@ -1,4 +1,4 @@
-# train.py
+# index.py
 
 # Copyright 2024 Kenny Peng
 #
@@ -23,7 +23,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from shutil import rmtree, move
+from shutil import rmtree
 from sys import stderr
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Generator, Literal, overload, TypedDict
