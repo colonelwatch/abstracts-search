@@ -83,9 +83,7 @@ def parse_args() -> Namespace:
     train.add_argument("-k", "--intersection", default=None, type=int)  # 1R@1 else kR@k
     train.add_argument("-c", "--clusters", default=None, type=int)
     train.add_argument("-q", "--queries", default=8192, type=int)
-    train.add_argument("-t", "--tasks", default=None, type=int)
     train.add_argument("-P", "--progress", action="store_true")
-    train.add_argument("--truncate", default=None, type=int)  # for experiments only
     train.add_argument("--batch-size", default=1024, type=int)
     train.add_argument("--shard-size", default=33554432, type=int)  # under 4GB
     train.add_argument("--use-cache", action="store_true")  # for experiments only
@@ -115,9 +113,7 @@ class TrainArgs:
     intersection: int | None
     clusters: int | None
     queries: int
-    tasks: int | None
     progress: bool
-    truncate: bool
     batch_size: int
     shard_size: int
     use_cache: bool
@@ -126,7 +122,6 @@ class TrainArgs:
     ivf_encoding: str = field(init=False, compare=False)
     one_recall_at_one: bool = field(init=False, compare=False)
     k: int = field(init=False, compare=False)
-    n_tasks: int = field(init=False, compare=False)
 
     @classmethod
     def from_namespace(cls, namespace: Namespace):
@@ -159,19 +154,6 @@ class TrainArgs:
 
         self.one_recall_at_one = (self.intersection is None)
         self.k = 1 if self.intersection is None else self.intersection
-
-        if not torch.cuda.is_available():
-            raise ValueError("failed to find a NVIDIA GPU")
-        n_gpus = torch.cuda.device_count()
-        if self.tasks is None:
-            self.n_tasks = n_gpus
-        else:
-            self.n_tasks = self.tasks
-            if self.tasks < n_gpus:
-                warnings.warn(
-                    '"--tasks" set under the number of available GPUs, '
-                    'will use no more than "--tasks" GPUs'
-                )
 
 
 def load_dataset(dir: Path) -> Dataset:
@@ -244,7 +226,7 @@ def create_memmap(
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
         batches = iter_tensors(dataset, args.batch_size, "numpy")
-        batches = imap(batches, preproc, args.n_tasks)
+        batches = imap(batches, preproc, -1)
         with tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
         ) as counter:
@@ -367,8 +349,8 @@ def make_ground_truth(
     ) as counter:
         batches = iter_tensors(dataset, args.batch_size)
         batches, batches_copy = tee(batches, 2)
-        lengths = imap(batches_copy, get_length, None)
-        batches = imap_multi_gpu(batches, local_topk, args.n_tasks)
+        lengths = imap(batches_copy, get_length, 0)
+        batches = imap_multi_gpu(batches, local_topk)
         batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
         batches = zip(lengths, batches)
         for length, (gt_ids, _) in batches:
@@ -457,7 +439,7 @@ def make_index_shards(
         )
 
         batches = iter_tensors(shard, args.batch_size)
-        batches = imap(batches, preproc, None)
+        batches = imap(batches, preproc, 0)
         for ids, x in batches:
             on_gpu.add_with_ids(x.numpy(), ids.numpy())  # type: ignore
 
@@ -473,7 +455,7 @@ def make_index_shards(
         shards = range(0, n_dataset, args.shard_size)
         n_shards = len(shards)
         shards = iunsqueeze(shards)
-        shards = imap_multi_gpu(shards, make_shard, args.n_tasks)
+        shards = imap_multi_gpu(shards, make_shard)
         shards = tqdm(
             shards, desc="fill_index", total=n_shards, disable=(not args.progress)
         )
@@ -618,8 +600,6 @@ def main():
         disable_progress_bars()
 
     dataset = load_dataset(args.source)
-    if args.truncate is not None:
-        dataset = dataset.take(args.truncate)
 
     if args.clusters is None:
         clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE

@@ -1,9 +1,12 @@
+import os
+
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from itertools import cycle, tee
 from typing import Any, Callable, Concatenate, Generator, Iterable, Literal, overload
 
 import torch
+
 
 @overload  # noqa: E302
 def iunzip[T, U](
@@ -38,7 +41,7 @@ def iunsqueeze[T](arg_iter: Iterable[T]) -> Iterable[tuple[T]]:
 def imap[T, U_contra](
     inputs: Iterable[tuple[U_contra]],
     func: Callable[[U_contra], T],
-    n_tasks: int | None,
+    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
@@ -46,7 +49,7 @@ def imap[T, U_contra](
 def imap[T, U_contra, V_contra](
     inputs: Iterable[tuple[U_contra, V_contra]],
     func: Callable[[U_contra, V_contra], T],
-    n_tasks: int | None,
+    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
@@ -54,19 +57,21 @@ def imap[T, U_contra, V_contra](
 def imap[T, U_contra, V_contra, W_contra](
     inputs: Iterable[tuple[U_contra, V_contra, W_contra]],
     func: Callable[[U_contra, V_contra, W_contra], T],
-    n_tasks: int | None,
+    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
 def imap[T](  # noqa: E302
     inputs: Iterable[tuple],
     func: Callable[..., T],
-    n_tasks: int | None,
+    n_tasks: int,
 ) -> Generator[T, None, None]:
-    if n_tasks is None:
+    if n_tasks == 0:
         for data_in in inputs:
             yield func(*data_in)
         return
+    elif n_tasks < 0:
+        n_tasks = os.cpu_count() or 1
 
     tasks = deque[Future[T]]()
     with ThreadPoolExecutor(n_tasks) as executor:
@@ -88,7 +93,6 @@ def imap[T](  # noqa: E302
 def imap_multi_gpu[T, U_contra](
     inputs: Iterable[tuple[U_contra]],
     func: Callable[[torch.device, U_contra], T],
-    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
@@ -96,7 +100,6 @@ def imap_multi_gpu[T, U_contra](
 def imap_multi_gpu[T, U_contra, V_contra](
     inputs: Iterable[tuple[U_contra, V_contra]],
     func: Callable[[torch.device, U_contra, V_contra], T],
-    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
@@ -104,21 +107,19 @@ def imap_multi_gpu[T, U_contra, V_contra](
 def imap_multi_gpu[T, U_contra, V_contra, W_contra](
     inputs: Iterable[tuple[U_contra, V_contra, W_contra]],
     func: Callable[[torch.device, U_contra, V_contra, W_contra], T],
-    n_tasks: int,
 ) -> Generator[T, None, None]:
     ...
 
 def imap_multi_gpu[T](  # noqa: E302
     inputs: Iterable[tuple],
     func: Callable[Concatenate[torch.device, ...], T],
-    n_tasks: int,
 ) -> Generator[T, None, None]:
 
     def func_with_gpu(device: torch.device, data_in: tuple) -> T:
         data_out = func(device, *data_in)
         return data_out
 
-    n_gpus = min(n_tasks, torch.cuda.device_count())
+    n_gpus = torch.cuda.device_count()
     devices = cycle(torch.device(f"cuda:{i}") for i in range(n_gpus))
-    for data_out in imap(zip(devices, inputs), func_with_gpu, n_tasks):
+    for data_out in imap(zip(devices, inputs), func_with_gpu, n_gpus):
         yield data_out
