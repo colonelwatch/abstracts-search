@@ -149,8 +149,12 @@ class TrainArgs:
         else:
             raise ValueError(f'preprocessing string "{self.preprocess}" is not valid')
 
-        self.one_recall_at_one = (self.intersection is None)
-        self.k = 1 if self.intersection is None else self.intersection
+        if self.intersection is None:
+            self.one_recall_at_one = True
+            self.k = 1
+        else:
+            self.one_recall_at_one = False
+            self.k = self.intersection
 
 
 def load_dataset(dir: Path) -> Dataset:
