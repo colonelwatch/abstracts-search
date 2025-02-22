@@ -45,7 +45,7 @@ from utils.gpu_utils import imap, imap_multi_gpu
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
 OPQ_PATTERN = re.compile(r"OPQ([0-9]+)(?:_([0-9]+))?")
 RR_PATTERN = re.compile(r"(?:PCAR|RR)([0-9]+)")  # RR <==> PCAR without the PCA
-VALID_OPQ_WIDTHS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32, 48, 56, 64, 96]
+GPU_OPQ_WIDTHS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32, 48, 56, 64, 96]  # GPU widths
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,6 @@ def parse_args() -> Namespace:
     train.add_argument("-q", "--queries", default=8192, type=int)
     train.add_argument("-P", "--progress", action="store_true")
     train.add_argument("--batch-size", default=1024, type=int)
-    train.add_argument("--shard-size", default=33554432, type=int)  # under 4GB
     train.add_argument("--use-cache", action="store_true")  # for experiments only
 
     return parser.parse_args()
@@ -116,11 +115,11 @@ class TrainArgs:
     queries: int
     progress: bool
     batch_size: int
-    shard_size: int
     use_cache: bool
 
     # not args
     ivf_encoding: str = field(init=False, compare=False)
+    encoding_width: int = field(init=False, compare=False)
     one_recall_at_one: bool = field(init=False, compare=False)
     k: int = field(init=False, compare=False)
 
@@ -139,19 +138,16 @@ class TrainArgs:
             self.normalize = True
             warnings.warn("inferring --normalize from --dimension")
 
-        if not (
-            (
-                (match := OPQ_PATTERN.match(self.preprocess)) and
-                int(match[1]) in VALID_OPQ_WIDTHS
-            ) or
-            RR_PATTERN.match(self.preprocess)
-        ):
-            raise ValueError(f'preprocess string "{self.preprocess}" is not valid')
-
-        if match := OPQ_PATTERN.match(self.preprocess):
+        if (match := OPQ_PATTERN.match(self.preprocess)):
             self.ivf_encoding = f"PQ{match[1]}"
-        else:  # RR_PATTERN.match(self.preprocess)
+            self.encoding_width = int(match[1])
+            if self.encoding_width not in GPU_OPQ_WIDTHS:
+                raise ValueError(f"OPQ width {self.encoding_width} is not valid")
+        elif (match := RR_PATTERN.match(self.preprocess)):
             self.ivf_encoding = "SQ8"
+            self.encoding_width = int(match[1])
+        else:
+            raise ValueError(f'preprocessing string "{self.preprocess}" is not valid')
 
         self.one_recall_at_one = (self.intersection is None)
         self.k = 1 if self.intersection is None else self.intersection
@@ -412,6 +408,12 @@ def make_index_shards(
         empty_path = dir / "empty.faiss"
         faiss.write_index(trained_index, str(empty_path))
 
+        # set shard sizes such that file size is under the FAT32 limit (4 GiB),
+        # including disk usage at zero entries and the 64-bit ID
+        usage_at_zero = empty_path.stat().st_size
+        entry_size = args.encoding_width + 8
+        shard_size = (4 * (1024 * 1024 * 1024) - usage_at_zero) // entry_size
+
         # copy trained index
         on_gpus: deque[faiss.Index] = deque(
             to_gpu(trained_index) for _ in range(torch.cuda.device_count())
@@ -419,9 +421,9 @@ def make_index_shards(
         index: faiss.Index = faiss.clone_index(trained_index)
 
         with tqdm(desc="fill_index", total=n_dataset, disable=(not args.progress)) as c:
-            for i_shard, row_start in enumerate(range(0, n_dataset, args.shard_size)):
+            for i_shard, row_start in enumerate(range(0, n_dataset, shard_size)):
                 shard = dataset.select(  # yields another Datset not rows
-                    range(row_start, min(row_start + args.shard_size, len(dataset)))
+                    range(row_start, min(row_start + shard_size, len(dataset)))
                 )
 
                 batches = iter_tensors(shard, args.batch_size)
