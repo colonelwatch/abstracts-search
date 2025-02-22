@@ -343,7 +343,7 @@ def make_ground_truth(
     ground_truth = Dataset.from_dict(
         {
             "embedding": q_embeddings,
-            "gt_ids": gt_ids.numpy().astype(np.int64),  # faiss expects int64
+            "gt_ids": gt_ids.numpy(),
         }
     )
     ground_truth.save_to_disk(cache_path)
@@ -464,12 +464,13 @@ def tune_index(
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
         q: npt.NDArray[np.float32] = ground_truth["embedding"]  # type: ignore
-        gt_ids: npt.NDArray[np.int64] = ground_truth["gt_ids"]  # type: ignore
+        gt_ids: npt.NDArray[np.int32] = ground_truth["gt_ids"]  # type: ignore
 
     if args.dimensions is not None:
         q = q[:, :args.dimensions]
     if args.normalize:
         q = q / np.linalg.norm(q, ord=2, axis=1)[:, np.newaxis]
+    gt_ids_int64 = gt_ids.astype(np.int64)  # faiss expects int64
 
     # init with ground-truth IDs but not ground-truth distances because faiss doesn't
     # use them anyway (see faiss/AutoTune.cpp)
@@ -477,7 +478,7 @@ def tune_index(
         criterion = faiss.OneRecallAtRCriterion(len(ground_truth), 1)
     else:
         criterion = faiss.IntersectionCriterion(len(ground_truth), args.k)
-    criterion.set_groundtruth(None, gt_ids)  # type: ignore (monkey-patched)
+    criterion.set_groundtruth(None, gt_ids_int64)  # type: ignore (monkey-patched)
 
     params = faiss.ParameterSpace()
     params.verbose = args.progress
