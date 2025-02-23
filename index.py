@@ -161,13 +161,6 @@ def load_dataset(dir: Path) -> Dataset:
     return dataset.add_column("index", ids)  # type: ignore  (wrong func signature)
 
 
-def splits(
-    dataset: Dataset, train_size: int, test_size: int, seed: int = 42
-) -> tuple[Dataset, Dataset]:
-    splits = dataset.train_test_split(test_size, train_size, seed=seed)
-    return splits["train"], splits["test"]  # result: two sets of indices, one file
-
-
 def hash(parameters: list) -> str:
     h = Hasher()
     for parameter in parameters:
@@ -582,7 +575,9 @@ def main():
     factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
     train_size = TRAIN_SIZE_MULTIPLE * clusters
 
-    train, queries = splits(dataset, train_size, args.queries)
+    splits = dataset.train_test_split(args.queries, train_size, seed=42)
+    train = splits["train"]
+    queries = splits["test"]
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
         tmpdir = Path(tmpdir)
