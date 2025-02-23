@@ -1,4 +1,4 @@
-# index.py
+# train.py
 
 # Copyright 2024 Kenny Peng
 #
