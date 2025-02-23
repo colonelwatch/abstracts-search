@@ -176,47 +176,6 @@ def iter_tensors(
             yield batch["index"], batch["embedding"]  # type: ignore
 
 
-def create_memmap(
-    dataset: Dataset, cache_dir: Path, args: TrainArgs
-) -> np.memmap[Any, np.dtype[np.float32]]:
-    n = len(dataset)
-    d = len(dataset[0]["embedding"]) if args.dimensions is None else args.dimensions
-    shape = (n, d)
-
-    cache_identifier = hash([dataset._fingerprint, args.dimensions, args.normalize])
-    cache_path = cache_dir / f"train_{cache_identifier}.memmap"
-    if cache_path.exists():
-        return np.memmap(cache_path, np.float32, mode="r", shape=shape)
-
-    def preproc(_, embeddings: torch.Tensor) -> torch.Tensor:
-        if args.dimensions is not None:
-            embeddings = embeddings[:, :args.dimensions]
-        if args.normalize:
-            embeddings = torch.nn.functional.normalize(embeddings)
-        return embeddings
-
-    memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
-    try:
-        batches = iter_tensors(dataset)
-        batches = imap(batches, preproc, -1)
-        with tqdm(
-            desc="create_memmap", total=len(dataset), disable=(not args.progress)
-        ) as counter:
-            i = 0  # save batches to disk by assigning to memmap slices
-            for embeddings_batch in batches:
-                n_batch = len(embeddings_batch)
-                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
-                i += n_batch
-                counter.update(n_batch)
-    except (KeyboardInterrupt, Exception):
-        cache_path.unlink()
-        raise
-
-    # flush from RAM to disk, then destroy the object on RAM and recreate from disk
-    memmap.flush()
-    return np.memmap(cache_path, np.float32, mode="r", shape=shape)
-
-
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
     dataset: Dataset, queries: Dataset, cache_dir: Path, args: TrainArgs
@@ -334,6 +293,47 @@ def make_ground_truth(
     )
     ground_truth.save_to_disk(cache_path)
     return ground_truth
+
+
+def create_memmap(
+    dataset: Dataset, cache_dir: Path, args: TrainArgs
+) -> np.memmap[Any, np.dtype[np.float32]]:
+    n = len(dataset)
+    d = len(dataset[0]["embedding"]) if args.dimensions is None else args.dimensions
+    shape = (n, d)
+
+    cache_identifier = hash([dataset._fingerprint, args.dimensions, args.normalize])
+    cache_path = cache_dir / f"train_{cache_identifier}.memmap"
+    if cache_path.exists():
+        return np.memmap(cache_path, np.float32, mode="r", shape=shape)
+
+    def preproc(_, embeddings: torch.Tensor) -> torch.Tensor:
+        if args.dimensions is not None:
+            embeddings = embeddings[:, :args.dimensions]
+        if args.normalize:
+            embeddings = torch.nn.functional.normalize(embeddings)
+        return embeddings
+
+    memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
+    try:
+        batches = iter_tensors(dataset)
+        batches = imap(batches, preproc, -1)
+        with tqdm(
+            desc="create_memmap", total=len(dataset), disable=(not args.progress)
+        ) as counter:
+            i = 0  # save batches to disk by assigning to memmap slices
+            for embeddings_batch in batches:
+                n_batch = len(embeddings_batch)
+                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
+                i += n_batch
+                counter.update(n_batch)
+    except (KeyboardInterrupt, Exception):
+        cache_path.unlink()
+        raise
+
+    # flush from RAM to disk, then destroy the object on RAM and recreate from disk
+    memmap.flush()
+    return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
 
 def to_gpu(index: faiss.Index, device: int = 0) -> faiss.Index:
