@@ -367,17 +367,9 @@ def make_index(
     dir: Path,
     trained_index: faiss.Index,
     dataset: Dataset,
-    holdout_ids: npt.NDArray | None,
+    holdouts: torch.Tensor | None,
     args: TrainArgs,
 ) -> None:
-    # Determine n_dataset and holdouts (and copy them to GPUs)
-    if holdout_ids is not None:
-        holdouts = torch.from_numpy(holdout_ids)
-        n_dataset = len(dataset) - len(holdout_ids)
-    else:
-        holdouts = None
-        n_dataset = len(dataset)
-
     def preproc(
         ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -405,8 +397,9 @@ def make_index(
         )
         index: faiss.Index = faiss.clone_index(trained_index)
 
-        with tqdm(desc="fill_index", total=n_dataset, disable=(not args.progress)) as c:
-            for i_shard, row_start in enumerate(range(0, n_dataset, SHARD_SIZE)):
+        n_ids = (len(dataset) - len(holdouts)) if holdouts is not None else len(dataset)
+        with tqdm(desc="fill_index", total=n_ids, disable=(not args.progress)) as c:
+            for i_shard, row_start in enumerate(range(0, len(dataset), SHARD_SIZE)):
                 shard = dataset.select(  # yields another Datset not rows
                     range(row_start, min(row_start + SHARD_SIZE, len(dataset)))
                 )
@@ -588,8 +581,8 @@ def main():
 
         faiss_index = train_index(train_memmap, factory_string)
 
-        with queries.formatted_as("numpy"):
-            q_ids: npt.NDArray = queries["index"]  # type: ignore
+        with queries.formatted_as("torch"):
+            q_ids: torch.Tensor = queries["index"]  # type: ignore
         make_index(tmpdir, faiss_index, dataset, q_ids, args)
         merged_index = open_ondisk(tmpdir)
         optimal_params = tune_index(merged_index, ground_truth, args)
