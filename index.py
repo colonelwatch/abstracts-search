@@ -78,8 +78,7 @@ def parse_args() -> Namespace:
     train.add_argument("source", type=Path)
     train.add_argument("dest", type=Path)
     train.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
-    train.add_argument("-N", "--normalize", action="store_true")
-    train.add_argument("-I", "--inner-product", action="store_true")
+    train.add_argument("-N", "--normalize", action="store_true")  # also if normalize_d_
     train.add_argument("-p", "--preprocess", default="OPQ96_384")
     train.add_argument("-k", "--intersection", default=None, type=int)  # 1R@1 else kR@k
     train.add_argument("-c", "--clusters", default=None, type=int)
@@ -108,7 +107,6 @@ class TrainArgs:
     dest: Path
     dimensions: int | None
     normalize: bool
-    inner_product: bool
     preprocess: str
     intersection: int | None
     clusters: int | None
@@ -238,7 +236,6 @@ def make_ground_truth(
             args.normalize,
             args.batch_size,
             args.k,
-            args.inner_product
         ]
     )
     cache_path = cache_dir / f"gt_{cache_identifier}"
@@ -257,6 +254,9 @@ def make_ground_truth(
     q_embeddings_copy = [q_embeddings.to(f"cuda:{i}") for i in range(n_devices)]
     q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
 
+    # for unit vectors, the L2 minimizing is also the inner-product maximizing
+    inner_product_search = args.normalize
+
     def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
         return len(ids)
 
@@ -272,10 +272,10 @@ def make_ground_truth(
         embeddings = embeddings[not_in_queries]
         ids = ids[not_in_queries]
 
-        if args.normalize:
+        if inner_product_search:
+            # ensure that the vectors are unit-length
             embeddings = torch.nn.functional.normalize(embeddings)
 
-        if args.inner_product:
             # becomes a matmult for multiple data
             scores = q_embeddings_copy[device.index] @ embeddings.T
         else:
@@ -288,7 +288,7 @@ def make_ground_truth(
 
         # only yield k from this batch, in the extreme this k replaces all running k
         top_scores, argtop = torch.topk(
-            scores, args.k, dim=1, largest=args.inner_product  # min L2 or max IP
+            scores, args.k, dim=1, largest=inner_product_search
         )
         top_ids = ids[argtop.flatten()].reshape(argtop.shape)
 
@@ -311,7 +311,7 @@ def make_ground_truth(
         gt_scores = torch.hstack((gt_scores, batch_scores))
         gt_ids = torch.hstack((gt_ids, batch_ids))
         gt_scores, argtop = torch.topk(
-            gt_scores, args.k, dim=1, largest=args.inner_product
+            gt_scores, args.k, dim=1, largest=inner_product_search
         )
         gt_ids = torch.gather(gt_ids, 1, argtop)
 
@@ -321,7 +321,7 @@ def make_ground_truth(
     n_q, _ = q_embeddings.shape
     shape = (n_q, args.k)
     gt_ids = torch.full(shape, -1, dtype=torch.int32).cuda()
-    if args.inner_product:
+    if inner_product_search:
         gt_scores = torch.zeros(shape, dtype=torch.float32).cuda()
     else:
         gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
@@ -364,11 +364,11 @@ def to_cpu(index: faiss.Index) -> faiss.Index:
 def train_index(
     embeddings: npt.NDArray[np.float32] | np.memmap[Any, np.dtype[np.float32]],
     factory_string: str,
-    inner_product: bool,
 ) -> faiss.Index:
+    # doing a bit of testing seems to show that passing METRIC_L2 is superior to passing 
+    # METRIC_INNER_PRODUCT for the same factory string, even for normalized embeddings
     _, d = embeddings.shape
-    metric = faiss.METRIC_INNER_PRODUCT if inner_product else faiss.METRIC_L2
-    index: faiss.Index = faiss.index_factory(d, factory_string, metric)
+    index: faiss.Index = faiss.index_factory(d, factory_string, faiss.METRIC_L2)
 
     index = to_gpu(index)
     index.train(embeddings)  # type: ignore (monkey-patched)
@@ -596,7 +596,7 @@ def main():
         ground_truth = make_ground_truth(dataset, queries, working_dir, args)
         train_memmap = create_memmap(train, working_dir, args)
 
-        faiss_index = train_index(train_memmap, factory_string, args.inner_product)
+        faiss_index = train_index(train_memmap, factory_string)
 
         shards_dir = Path(tmpdir) / "shards"
         with queries.formatted_as("numpy"):
