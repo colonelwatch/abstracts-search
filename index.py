@@ -16,7 +16,6 @@
 
 from argparse import ArgumentParser, Namespace
 from collections import deque
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
@@ -40,12 +39,14 @@ import numpy.typing as npt
 import torch
 from tqdm import tqdm
 
-from utils.gpu_utils import imap, imap_multi_gpu
+from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
 OPQ_PATTERN = re.compile(r"OPQ([0-9]+)(?:_([0-9]+))?")
 RR_PATTERN = re.compile(r"(?:PCAR|RR)([0-9]+)")  # RR <==> PCAR without the PCA
 GPU_OPQ_WIDTHS = [1, 2, 3, 4, 8, 12, 16, 20, 24, 28, 32, 48, 56, 64, 96]  # GPU widths
+BATCH_SIZE = 1024
+SHARD_SIZE = 1048576  # keep temporary shard sizes small to save on RAM
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,6 @@ def parse_args() -> Namespace:
     train.add_argument("-c", "--clusters", default=None, type=int)
     train.add_argument("-q", "--queries", default=8192, type=int)
     train.add_argument("-P", "--progress", action="store_true")
-    train.add_argument("--batch-size", default=1024, type=int)
     train.add_argument("--use-cache", action="store_true")  # for experiments only
 
     return parser.parse_args()
@@ -112,7 +112,6 @@ class TrainArgs:
     clusters: int | None
     queries: int
     progress: bool
-    batch_size: int
     use_cache: bool
 
     # not args
@@ -176,11 +175,11 @@ def hash(parameters: list) -> str:
     return h.hexdigest()
 
 
-def iter_tensors(  # noqa: E302
-    dataset: Dataset, batch_size: int
+def iter_tensors(
+    dataset: Dataset
 ) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
     with dataset.formatted_as("torch", columns=["index", "embedding"]):
-        for batch in dataset.iter(batch_size):
+        for batch in dataset.iter(BATCH_SIZE):
             yield batch["index"], batch["embedding"]  # type: ignore
 
 
@@ -205,7 +204,7 @@ def create_memmap(
 
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
     try:
-        batches = iter_tensors(dataset, args.batch_size)
+        batches = iter_tensors(dataset)
         batches = imap(batches, preproc, -1)
         with tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
@@ -230,13 +229,7 @@ def make_ground_truth(
     dataset: Dataset, queries: Dataset, cache_dir: Path, args: TrainArgs
 ) -> Dataset:
     cache_identifier = hash(
-        [
-            dataset._fingerprint,
-            queries._fingerprint,
-            args.normalize,
-            args.batch_size,
-            args.k,
-        ]
+        [dataset._fingerprint, queries._fingerprint, args.normalize, args.k]
     )
     cache_path = cache_dir / f"gt_{cache_identifier}"
     if cache_path.exists():
@@ -329,7 +322,7 @@ def make_ground_truth(
     with tqdm(
         desc="make_ground_truth", total=len(dataset), disable=(not args.progress)
     ) as counter:
-        batches = iter_tensors(dataset, args.batch_size)
+        batches = iter_tensors(dataset)
         batches, batches_copy = tee(batches, 2)
         lengths = imap(batches_copy, get_length, 0)
         batches = imap_multi_gpu(batches, local_topk)
@@ -377,7 +370,7 @@ def train_index(
     return index
 
 
-def make_index_shards(
+def make_index(
     dir: Path,
     trained_index: faiss.Index,
     dataset: Dataset,
@@ -405,19 +398,14 @@ def make_index_shards(
             embeddings = torch.nn.functional.normalize(embeddings)
         return ids, embeddings
 
-    # write shards to disk so that file sizes stay under 4GB but also because
-    # holding them all in RAM causes OOM-kill (on my machine with 16GB + 16GB swap!)
-    dir.mkdir()
+    def transfer_and_reset(on_gpu: faiss.Index) -> faiss.Index:
+        on_cpu = to_cpu(on_gpu)
+        on_gpu.reset()
+        return on_cpu
+
+    # write shards to disk because holding them all in RAM causes OOM-kill
+    shard_paths: list[Path] = []
     try:
-        empty_path = dir / "empty.faiss"
-        faiss.write_index(trained_index, str(empty_path))
-
-        # set shard sizes such that file size is under the FAT32 limit (4 GiB),
-        # including disk usage at zero entries and the 64-bit ID
-        usage_at_zero = empty_path.stat().st_size
-        entry_size = args.encoding_width + 8
-        shard_size = (4 * (1024 * 1024 * 1024) - usage_at_zero) // entry_size
-
         # copy trained index
         on_gpus: deque[faiss.Index] = deque(
             to_gpu(trained_index) for _ in range(torch.cuda.device_count())
@@ -425,38 +413,43 @@ def make_index_shards(
         index: faiss.Index = faiss.clone_index(trained_index)
 
         with tqdm(desc="fill_index", total=n_dataset, disable=(not args.progress)) as c:
-            for i_shard, row_start in enumerate(range(0, n_dataset, shard_size)):
+            for i_shard, row_start in enumerate(range(0, n_dataset, SHARD_SIZE)):
                 shard = dataset.select(  # yields another Datset not rows
-                    range(row_start, min(row_start + shard_size, len(dataset)))
+                    range(row_start, min(row_start + SHARD_SIZE, len(dataset)))
                 )
 
-                batches = iter_tensors(shard, args.batch_size)
+                batches = iter_tensors(shard)
                 batches = imap(batches, preproc, -1)
                 for ids, embds in batches:
                     on_gpus[0].add_with_ids(embds.numpy(), ids.numpy())  # type: ignore
                     on_gpus.rotate(-1)
                     c.update(len(ids))
 
-                for on_gpu in on_gpus:
-                    index.merge_from(to_cpu(on_gpu))
-                    on_gpu.reset()
-                faiss.write_index(index, str(dir / f"shard_{i_shard:03d}.faiss"))
+                # transfer takes time, so do this across all GPUs in parallel
+                for on_cpu in imap(iunsqueeze(on_gpus), transfer_and_reset, -1):
+                    index.merge_from(on_cpu)
+
+                shard_path = dir / f"shard_{i_shard:03d}.faiss"
+                faiss.write_index(index, str(shard_path))
+                shard_paths.append(shard_path)
+
                 index.reset()
-    except (KeyboardInterrupt, Exception):
-        rmtree(dir)
-        raise
 
-
-@contextmanager
-def merged(dir: Path) -> Generator[faiss.Index, None, None]:
-    empty_path = dir / "empty.faiss"
-    shard_paths = [str(p) for p in dir.glob("shard_*.faiss")]
-    index = faiss.read_index(str(empty_path))
-    try:
-        merge_ondisk(index, shard_paths, "temp.ivfdata")
-        yield index
+        # merge_ondisk takes file _names_ and only puts in working directory...
+        ondisk_relpath = Path("./ondisk.ivfdata")
+        merge_ondisk(index, [str(p) for p in shard_paths], ondisk_relpath.name)
+        ondisk_relpath.rename(dir / ondisk_relpath)  # ... so move it after
     finally:
-        Path("temp.ivfdata").unlink(missing_ok=True)
+        for p in shard_paths:
+            p.unlink()
+
+    # write the index (which points to `ondisk.ivfdata`) and drop the shards
+    faiss.write_index(index, str(dir / "index.faiss"))
+
+
+def open_ondisk(dir: Path) -> faiss.Index:
+    # without IO_FLAG_ONDISK_SAME_DIR, read_index gets on-disk indices in working dir
+    return faiss.read_index(str(dir / "index.faiss"), faiss.IO_FLAG_ONDISK_SAME_DIR)
 
 
 def tune_index(
@@ -499,9 +492,9 @@ def tune_index(
     return optimal_params
 
 
-def save_ids(path: Path, dataset: Dataset, batch_size: int):
+def save_ids(path: Path, dataset: Dataset):
     # the columns themselves aren't needed to run the index
-    dataset.remove_columns("embedding").to_parquet(path, batch_size, compression="lz4")
+    dataset.remove_columns("embedding").to_parquet(path, BATCH_SIZE, compression="lz4")
 
 
 def save_optimal_params(
@@ -592,26 +585,27 @@ def main():
     train, queries = splits(dataset, train_size, args.queries)
 
     with TemporaryDirectory(dir=cache_dir) as tmpdir:
-        working_dir = cache_dir if args.use_cache else Path(tmpdir)
+        tmpdir = Path(tmpdir)
+
+        working_dir = cache_dir if args.use_cache else tmpdir
         ground_truth = make_ground_truth(dataset, queries, working_dir, args)
         train_memmap = create_memmap(train, working_dir, args)
 
         faiss_index = train_index(train_memmap, factory_string)
 
-        shards_dir = Path(tmpdir) / "shards"
         with queries.formatted_as("numpy"):
             q_ids: npt.NDArray = queries["index"]  # type: ignore
-        make_index_shards(shards_dir, faiss_index, dataset, q_ids, args)
-        with merged(shards_dir) as merged_index:
-            optimal_params = tune_index(merged_index, ground_truth, args)
+        make_index(tmpdir, faiss_index, dataset, q_ids, args)
+        merged_index = open_ondisk(tmpdir)
+        optimal_params = tune_index(merged_index, ground_truth, args)
 
     args.dest.mkdir()
     try:
-        save_ids(args.dest / "ids.parquet", dataset, args.batch_size)
+        save_ids(args.dest / "ids.parquet", dataset)
         save_optimal_params(
             args.dest / "params.json", args.dimensions, args.normalize, optimal_params
         )
-        make_index_shards(args.dest / "shards", faiss_index, dataset, None, args)
+        make_index(args.dest, faiss_index, dataset, None, args)
     except (KeyboardInterrupt, Exception):
         rmtree(args.dest)
         raise
