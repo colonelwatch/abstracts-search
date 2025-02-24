@@ -23,7 +23,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from shutil import rmtree
+from shutil import rmtree, copy
 from sys import stderr
 from tempfile import TemporaryDirectory
 from typing import Any, Callable, Generator, Literal, TypedDict
@@ -348,28 +348,46 @@ def to_cpu(index: faiss.Index) -> faiss.Index:
 
 
 def train_index(
-    embeddings: npt.NDArray[np.float32] | np.memmap[Any, np.dtype[np.float32]],
-    factory_string: str,
-) -> faiss.Index:
-    # doing a bit of testing seems to show that passing METRIC_L2 is superior to passing 
+    train: Dataset, factory_string: str, cache_dir: Path, args: TrainArgs
+) -> Path:
+    cache_identifier = hash([train._fingerprint, factory_string])
+    cache_path = cache_dir / f"empty_{cache_identifier}.faiss"
+    if cache_path.exists():
+        return cache_path
+
+    train_memmap = create_memmap(train, cache_dir, args)
+
+    # doing a bit of testing seems to show that passing METRIC_L2 is superior to passing
     # METRIC_INNER_PRODUCT for the same factory string, even for normalized embeddings
-    _, d = embeddings.shape
+    _, d = train_memmap.shape
     index: faiss.Index = faiss.index_factory(d, factory_string, faiss.METRIC_L2)
 
     index = to_gpu(index)
-    index.train(embeddings)  # type: ignore (monkey-patched)
+    index.train(train_memmap)  # type: ignore (monkey-patched)
     index = to_cpu(index)
 
-    return index
+    faiss.write_index(index, str(cache_path))
+    return cache_path
 
 
 def make_index(
     dir: Path,
-    trained_index: faiss.Index,
+    trained_path: Path,
     dataset: Dataset,
     holdouts: torch.Tensor | None,
+    cache_dir: Path,
     args: TrainArgs,
 ) -> None:
+    holdout_list = [] if holdouts is None else holdouts.tolist()
+    cache_identifier = hash([trained_path, dataset._fingerprint, *holdout_list])
+
+    index_cache_path = cache_dir / f"filled_{cache_identifier}.faiss"
+    ondisk_cache_path = cache_dir / f"ondisk_{cache_identifier}.ivfdata"
+    if index_cache_path.exists() and ondisk_cache_path.exists():
+        copy(index_cache_path, dir / "index.faiss")
+        copy(ondisk_cache_path, dir / "ondisk.ivfdata")
+        return
+
     def preproc(
         ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -391,6 +409,8 @@ def make_index(
     # write shards to disk because holding them all in RAM causes OOM-kill
     shard_paths: list[Path] = []
     try:
+        trained_index = faiss.read_index(str(trained_path))
+
         # copy trained index
         on_gpus: deque[faiss.Index] = deque(
             to_gpu(trained_index) for _ in range(torch.cuda.device_count())
@@ -431,6 +451,10 @@ def make_index(
 
     # write the index (which points to `ondisk.ivfdata`) and drop the shards
     faiss.write_index(index, str(dir / "index.faiss"))
+
+    # copy into the cache
+    copy(dir / "index.faiss", index_cache_path)
+    copy(dir / "ondisk.ivfdata", ondisk_cache_path)
 
 
 def open_ondisk(dir: Path) -> faiss.Index:
@@ -577,13 +601,11 @@ def main():
 
         working_dir = cache_dir if args.use_cache else tmpdir
         ground_truth = make_ground_truth(dataset, queries, working_dir, args)
-        train_memmap = create_memmap(train, working_dir, args)
-
-        faiss_index = train_index(train_memmap, factory_string)
+        trained_path = train_index(train, factory_string, working_dir, args)
 
         with queries.formatted_as("torch"):
             q_ids: torch.Tensor = queries["index"]  # type: ignore
-        make_index(tmpdir, faiss_index, dataset, q_ids, args)
+        make_index(tmpdir, trained_path, dataset, q_ids, working_dir, args)
         merged_index = open_ondisk(tmpdir)
         optimal_params = tune_index(merged_index, ground_truth, args)
 
@@ -593,7 +615,7 @@ def main():
         save_optimal_params(
             args.dest / "params.json", args.dimensions, args.normalize, optimal_params
         )
-        make_index(args.dest, faiss_index, dataset, None, args)
+        make_index(args.dest, trained_path, dataset, None, cache_dir, args)
     except (KeyboardInterrupt, Exception):
         rmtree(args.dest)
         raise
