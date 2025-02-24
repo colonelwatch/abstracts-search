@@ -15,7 +15,6 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
-from collections import deque
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
@@ -388,6 +387,13 @@ def make_index(
         copy(ondisk_cache_path, dir / "ondisk.ivfdata")
         return
 
+    # clone trained index for filling on the GPU and merging on the CPU
+    trained_index = faiss.read_index(str(trained_path))
+    on_gpus: list[faiss.Index] = [
+        to_gpu(trained_index) for _ in range(torch.cuda.device_count())
+    ]
+    index: faiss.Index = faiss.clone_index(trained_index)
+
     def preproc(
         ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -401,6 +407,13 @@ def make_index(
             embeddings = torch.nn.functional.normalize(embeddings)
         return ids, embeddings
 
+    def add_with_gpu(
+        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
+    ) -> int:
+        on_gpu = on_gpus[device.index]
+        on_gpu.add_with_ids(embeddings.numpy(), ids.numpy())  # type: ignore
+        return len(ids)  # yield the number of embeddings added
+
     def transfer_and_reset(on_gpu: faiss.Index) -> faiss.Index:
         on_cpu = to_cpu(on_gpu)
         on_gpu.reset()
@@ -409,16 +422,8 @@ def make_index(
     # write shards to disk because holding them all in RAM causes OOM-kill
     shard_paths: list[Path] = []
     try:
-        trained_index = faiss.read_index(str(trained_path))
-
-        # copy trained index
-        on_gpus: deque[faiss.Index] = deque(
-            to_gpu(trained_index) for _ in range(torch.cuda.device_count())
-        )
-        index: faiss.Index = faiss.clone_index(trained_index)
-
         n_ids = (len(dataset) - len(holdouts)) if holdouts is not None else len(dataset)
-        with tqdm(desc="fill_index", total=n_ids, disable=(not args.progress)) as c:
+        with tqdm(desc="make_index", total=n_ids, disable=(not args.progress)) as c:
             for i_shard, row_start in enumerate(range(0, len(dataset), SHARD_SIZE)):
                 shard = dataset.select(  # yields another Datset not rows
                     range(row_start, min(row_start + SHARD_SIZE, len(dataset)))
@@ -426,10 +431,9 @@ def make_index(
 
                 batches = iter_tensors(shard)
                 batches = imap(batches, preproc, -1)
-                for ids, embds in batches:
-                    on_gpus[0].add_with_ids(embds.numpy(), ids.numpy())  # type: ignore
-                    on_gpus.rotate(-1)
-                    c.update(len(ids))
+                counts = imap_multi_gpu(batches, add_with_gpu)
+                for count in counts:
+                    c.update(count)
 
                 # transfer takes time, so do this across all GPUs in parallel
                 for on_cpu in imap(iunsqueeze(on_gpus), transfer_and_reset, -1):
