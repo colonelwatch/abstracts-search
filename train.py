@@ -349,7 +349,9 @@ def to_cpu(index: faiss.Index) -> faiss.Index:
 def train_index(
     train: Dataset, factory_string: str, cache_dir: Path, args: TrainArgs
 ) -> Path:
-    cache_identifier = hash([train._fingerprint, factory_string])
+    cache_identifier = hash(  # includes create_memmap parameters
+        [train._fingerprint, factory_string, args.dimensions, args.normalize]
+    )
     cache_path = cache_dir / f"empty_{cache_identifier}.faiss"
     if cache_path.exists():
         return cache_path
