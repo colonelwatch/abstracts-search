@@ -615,16 +615,19 @@ def main():
         merged_index = open_ondisk(tmpdir)
         optimal_params = tune_index(merged_index, ground_truth, args)
 
-    args.dest.mkdir()
-    try:
-        save_ids(args.dest / "ids.parquet", dataset)
-        save_optimal_params(
-            args.dest / "params.json", args.dimensions, args.normalize, optimal_params
-        )
-        make_index(args.dest, trained_path, dataset, None, cache_dir, args)
-    except (KeyboardInterrupt, Exception):
-        rmtree(args.dest)
-        raise
+        args.dest.mkdir()
+        try:
+            save_ids(args.dest / "ids.parquet", dataset)
+            save_optimal_params(
+                args.dest / "params.json",
+                args.dimensions,
+                args.normalize,
+                optimal_params
+            )
+            make_index(args.dest, trained_path, dataset, None, cache_dir, args)
+        except (KeyboardInterrupt, Exception):
+            rmtree(args.dest)
+            raise
 
 
 if __name__ == "__main__":
