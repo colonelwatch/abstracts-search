@@ -32,7 +32,7 @@ Building of `abstracts-embeddings` was done on a Google Cloud machine with four 
 
 There are two ways to build the index: from the `abstracts-embeddings` (with sync) or from scratch, using the OpenAlex S3 bucket.
 
-Either way, make sure `aws` (AWS CLI), `git-lfs`, `mbuffer`, and `conda` are available, and make sure Git over SSH is set up. Then, start with the following.
+Either way, make sure `aws` (AWS CLI), `git-lfs`, `mbuffer`, and `conda` are available, and make sure Git over SSH is set up. Then, start with the following setup.
 
 ```
 sudo nvidia-persistenced
@@ -52,6 +52,7 @@ The above commands do not yet download the generated embeddings or the built ind
 ```
 git submodule update --init
 make recover
+huggingface-cli lfs-enable-largefiles abstracts-index
 ```
 
 * To build from scratch, the submodules can be downloaded but with those things skipped.
@@ -61,6 +62,7 @@ make recover
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init
 git submodule update --init abstracts-embeddings
 rm -r abstracts-embeddings/data abstracts-embeddings/events abstracts-index/index
+huggingface-cli lfs-enable-largefiles abstracts-index
 ```
 
 Finally, build the index by running the following `make` command.
