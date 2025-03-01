@@ -1,4 +1,4 @@
-SHELL := bash  # TODO: lift this requirement?
+SHELL := bash
 PYTHON := conda run -n abstracts-search --live-stream python
 
 CFLAGS := -O2
