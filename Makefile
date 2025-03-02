@@ -6,7 +6,7 @@ BUILDFLAGS :=
 DUMPFLAGS :=
 TRAINFLAGS :=
 
-abstracts-index/index: abstracts-embeddings/data
+abstracts-index/faiss/index: abstracts-embeddings/data
 	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
 
 include remote_targets.mk

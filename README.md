@@ -50,19 +50,19 @@ The above commands do not yet download the generated embeddings or the built ind
 * To proceed building as usual, download the submodules, and then a recovery command needs to be run.
 
 ```
-git submodule update --init
+git submodule update --init --recursive
 make recover
-huggingface-cli lfs-enable-largefiles abstracts-index
+huggingface-cli lfs-enable-largefiles abstracts-index/faiss
 ```
 
 * To build from scratch, the submodules can be downloaded but with those things skipped.
 
 
 ```
-GIT_LFS_SKIP_SMUDGE=1 git submodule update --init
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
 git submodule update --init abstracts-embeddings
-rm -r abstracts-embeddings/data abstracts-embeddings/events abstracts-index/index
-huggingface-cli lfs-enable-largefiles abstracts-index
+rm -r abstracts-embeddings/data abstracts-embeddings/events abstracts-index/faiss/index
+huggingface-cli lfs-enable-largefiles abstracts-index/faiss
 ```
 
 Finally, build the index by running the following `make` command.
