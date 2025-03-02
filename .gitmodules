@@ -4,3 +4,6 @@
 [submodule "abstracts-index"]
 	path = abstracts-index
 	url = git@hf.co:spaces/colonelwatch/abstracts-index
+[submodule "abstracts-faiss"]
+	path = abstracts-faiss
+	url = git@hf.co:datasets/colonelwatch/abstracts-faiss

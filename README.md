@@ -2,17 +2,18 @@
 
 `abstracts-search` is a project about indexing 110 million academic publications into a single semantic search engine. The method behind it is to take the publicly-available abstracts in the [OpenAlex](https://openalex.org) dataset, generate embeddings using the [stella_en_1.5B_v5](https://huggingface.co/NovaSearch/stella_en_1.5B_v5) model, then train a fast index using [faiss](https://github.com/facebookresearch/faiss). Furthermore, this can be repeated to keep the index synced with the quarterly snapshots of the OpenAlex dataset.
 
-The project is split into three repositories:
+The project is split into four repositories:
 
 * `abstracts-search`: Hosts the embedding and indexing scripts, along with a Makefile for describing the entire build
 * `abstracts-embeddings`: Hosts the raw embeddings (released under CC0) as a [Hugging Face Dataset](https://huggingface.co/datasets/colonelwatch/abstracts-embeddings)
-* `abstracts-index`: Hosts the index and `app.py`, the search interface, as a [Hugging Face Space](https://huggingface.co/spaces/colonelwatch/abstracts-index) (also released under CC0)
+* `abstracts-index`: Hosts `app.py`, the search interface, as a [Hugging Face Space](https://huggingface.co/spaces/colonelwatch/abstracts-index) (also released under CC0)
+* `abstracts-faiss`: Hosts the index, which `app.py` accesses, as a [Hugging Face Dataset](https://huggingface.co/spaces/colonelwatch/abstracts-faiss) (also released under CC0)
 
 # Running
 
-An Internet connection is always needed. In regards to setup, packages are downloaded with conda or pip, and the model is downloaded from Hugging Face. All data associated with the publications (titles, abstracts, authors, etc) is retrieved from OpenAlex and are not provided with this project. `abstracts-embeddings` is only pairs of embeddings and OpenAlex IDs, and `abstracts-index` is only a trained index that takes query embeddings and outputs OpenAlex IDs. These IDs are used in a query sent to OpenAlex.
+An Internet connection is always needed. In regards to setup, packages are downloaded with conda or pip, and the model is downloaded from Hugging Face. All data associated with the publications (titles, abstracts, authors, etc) is retrieved from OpenAlex and are not provided with this project. `abstracts-faiss` is only a trained index that takes query embeddings and outputs OpenAlex IDs. These IDs are used in a query sent to OpenAlex.
 
-For running the index alone, without regular sync (originally generated on Jan 1, 2025), the only repo that needs to be cloned is `abstracts-index`:
+For running the search interface alone, without regular sync (last synced on Jan 1, 2025), the only repo that needs to be cloned is `abstracts-index`:
 
 ```
 git lfs install
@@ -45,14 +46,14 @@ conda env create -f environment.yml
 conda activate abstracts-search
 ```
 
-The above commands do not yet download the generated embeddings or the built index, which are in `abstracts-embeddings` and `abstracts-index`.
+The above commands do not yet download the generated embeddings or the built index, which are in `abstracts-embeddings` and `abstracts-faiss`.
 
 * To proceed building as usual, download the submodules, and then a recovery command needs to be run.
 
 ```
 git submodule update --init --recursive
 make recover
-huggingface-cli lfs-enable-largefiles abstracts-index/faiss
+huggingface-cli lfs-enable-largefiles abstracts-faiss
 ```
 
 * To build from scratch, the submodules can be downloaded but with those things skipped.
@@ -61,8 +62,8 @@ huggingface-cli lfs-enable-largefiles abstracts-index/faiss
 ```
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
 git submodule update --init abstracts-embeddings
-rm -r abstracts-embeddings/data abstracts-embeddings/events abstracts-index/faiss/index
-huggingface-cli lfs-enable-largefiles abstracts-index/faiss
+rm -r abstracts-embeddings/data abstracts-embeddings/events abstracts-faiss/index
+huggingface-cli lfs-enable-largefiles abstracts-faiss
 ```
 
 Finally, build the index by running the following `make` command.
