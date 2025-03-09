@@ -7,7 +7,7 @@ The project is split into four repositories:
 * `abstracts-search`: Hosts the embedding and indexing scripts, along with a Makefile for describing the entire build
 * `abstracts-embeddings`: Hosts the raw embeddings (released under CC0) as a [Hugging Face Dataset](https://huggingface.co/datasets/colonelwatch/abstracts-embeddings)
 * `abstracts-index`: Hosts `app.py`, the search interface, as a [Hugging Face Space](https://huggingface.co/spaces/colonelwatch/abstracts-index) (also released under CC0)
-* `abstracts-faiss`: Hosts the index, which `app.py` accesses, as a [Hugging Face Dataset](https://huggingface.co/spaces/colonelwatch/abstracts-faiss) (also released under CC0)
+* `abstracts-faiss`: Hosts the index, which `app.py` accesses, as a [Hugging Face Dataset](https://huggingface.co/datasets/colonelwatch/abstracts-faiss) (also released under CC0)
 
 # Running
 
