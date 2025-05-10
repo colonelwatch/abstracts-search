@@ -19,7 +19,7 @@ abstracts-embeddings/data abstracts-embeddings/events &: | $(events)
 # update oa_jsonl to handle that?
 # consider downloading the files via curl instead of aws s3 cp, even if we keep s3 ls?
 EQ := =
-events/updated_date$(EQ)% : oa_jsonl | data.sqlite events
+events/updated_date$(EQ)% : | oa_jsonl data.sqlite events
 	d="s3://openalex/data/works/$(subst events/,,$@)"; 			\
 	aws s3 ls --no-sign-request "$$d/" | 					\
 		sed -E "s|.* +(.*)|$$d/\1|" | 					\
