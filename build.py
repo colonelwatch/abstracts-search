@@ -15,12 +15,13 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import sys
 from subprocess import Popen, PIPE
 import sqlite3
-from typing import TextIO, BinaryIO, Iterable, Generator
+from typing import TextIO, BinaryIO, Iterable, Generator, Self
 
 from filelock import FileLock
 from sentence_transformers import SentenceTransformer
@@ -30,7 +31,8 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
-SQLITE_TIMEOUT = 90  # 20 parts takes about 37 seconds on my system
+FILTER_BATCH_SIZE = 1024  # distinct from batch size passed to encoding model
+FILTER_TASK_COUNT = 5  # database queries are not CPU bound
 
 
 def parse_args() -> Namespace:
@@ -107,6 +109,89 @@ def load_oajsonl_batched(
         yield ids_batch, documents_batch
 
 
+class SharedConnection:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._worker = ThreadPoolExecutor(1)
+        self._conn: sqlite3.Connection | None = None
+
+    def open(self) -> None:
+        fut = self._worker.submit(sqlite3.connect, self._path, autocommit=False)
+        self._conn = fut.result()
+
+    def close(self) -> None:
+        if self._conn is None:
+            raise RuntimeError("closed with a not-open connection")
+        fut = self._worker.submit(self._conn.close)
+        fut.result()
+        self._worker.shutdown()
+
+    def __enter__(self) -> Self:
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
+        self.close()
+
+    def pick_existing(self, ids: list[str]) -> list[str]:
+        def _pick_existing():
+            conn = self._ensure_conn()
+            placeholders = ", ".join("?" * len(ids))
+            return conn.execute(
+                f"SELECT id from embeddings WHERE id IN ({placeholders})", ids
+            ).fetchall()
+
+        fut = self._worker.submit(_pick_existing)
+        res: list[tuple[str]] = fut.result()
+
+        return [id_ for (id_,) in res]
+
+    def insert_async(
+        self, oa_ids: Iterable[str], embeddings: Iterable[torch.Tensor]
+    ) -> None:
+        def _insert():
+            conn = self._ensure_conn()
+            insert_embeddings(oa_ids, embeddings, conn)
+            conn.commit()
+        _ = self._worker.submit(_insert)
+
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("called with a not-open connection")
+        return self._conn
+
+
+def filter_batched(
+    batches: Iterable[tuple[list[str], list[str]]],
+    conn: SharedConnection,
+    batch_size: int,
+    n_tasks: int,
+) -> Generator[tuple[list[str], list[str]], None, None]:
+    filtereds: list[tuple[str, str]] = []
+
+    def roll(drain: bool):
+        nonlocal filtereds
+
+        while len(filtereds) >= batch_size or (drain and filtereds):
+            out = filtereds[:batch_size]
+            ids_out = [id_ for id_, _ in out]
+            documents_out = [document for _, document in out]
+            yield ids_out, documents_out
+
+            filtereds = filtereds[batch_size:]
+
+    def filt(ids: list[str], documents: list[str]):
+        batch = {id_: document for id_, document in zip(ids, documents)}
+        for id_ in conn.pick_existing(ids):
+            del batch[id_]
+        return batch
+
+    for filtered in imap(batches, filt, n_tasks):
+        filtereds.extend(filtered.items())
+        yield from roll(False)
+    yield from roll(True)
+
+
 # built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
 def encode_faster(
     model: SentenceTransformer,
@@ -157,20 +242,13 @@ def main():
         print("error: model doesn't have exact embedding dim", file=sys.stderr)
         exit(1)
 
-    batches = load_oajsonl_batched(sys.stdin.buffer, args.batch_size)
-    batches = encode_pipelined(batches, model, args.tasks, args.progress)
-
-    batches = list(batches)  # collect now to commit them all at once
-
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
-    with sqlite3.connect(
-        args.data_path,
-        timeout=SQLITE_TIMEOUT,
-        isolation_level="EXCLUSIVE",
-        autocommit=sqlite3.LEGACY_TRANSACTION_CONTROL,  # type: ignore
-    ) as conn:
+    with SharedConnection(args.data_path) as conn:
+        batches = load_oajsonl_batched(sys.stdin.buffer, FILTER_BATCH_SIZE)
+        batches = filter_batched(batches, conn, args.batch_size, FILTER_TASK_COUNT)
+        batches = encode_pipelined(batches, model, args.tasks, args.progress)
         for ids_batch, embeddings_batch in batches:
-            insert_embeddings(ids_batch, embeddings_batch, conn)
+            conn.insert_async(ids_batch, embeddings_batch)
 
 
 if __name__ == "__main__":
