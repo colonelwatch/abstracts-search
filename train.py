@@ -38,6 +38,7 @@ import numpy.typing as npt
 import torch
 from tqdm import tqdm
 
+from utils.env_utils import CACHE
 from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
@@ -565,17 +566,14 @@ def clean_cache(args: CleanArgs, cache_dir: Path):
 
 
 def main():
-    cache_dir = get_env_var(
-        "ABSTRACTS_SEARCH_CACHE", Path, Path.home() / ".cache/abstracts-search"
-    )
     args = parse_args()
 
     if args.mode == "clean":
         args = CleanArgs.from_namespace(args)
-        clean_cache(args, cache_dir)
+        clean_cache(args, CACHE)
         return 0
 
-    cache_dir.mkdir(exist_ok=True)
+    CACHE.mkdir(exist_ok=True)
 
     try:
         args = TrainArgs.from_namespace(args)
@@ -602,10 +600,10 @@ def main():
     train = splits["train"]
     queries = splits["test"]
 
-    with TemporaryDirectory(dir=cache_dir) as tmpdir:
+    with TemporaryDirectory(dir=CACHE) as tmpdir:
         tmpdir = Path(tmpdir)
 
-        working_dir = cache_dir if args.use_cache else tmpdir
+        working_dir = CACHE if args.use_cache else tmpdir
         ground_truth = make_ground_truth(dataset, queries, working_dir, args)
         trained_path = train_index(train, factory_string, working_dir, args)
 
@@ -624,7 +622,7 @@ def main():
                 args.normalize,
                 optimal_params
             )
-            make_index(args.dest, trained_path, dataset, None, cache_dir, args)
+            make_index(args.dest, trained_path, dataset, None, CACHE, args)
         except (KeyboardInterrupt, Exception):
             rmtree(args.dest)
             raise

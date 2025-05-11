@@ -69,7 +69,7 @@ huggingface-cli lfs-enable-largefiles abstracts-faiss
 Finally, build the index by running the following `make` command.
 
 ```
-make -j 4 BUILDFLAGS='-m "NovaSearch/stella_en_1.5B_v5" -b 32 --trust-remote-code' DUMPFLAGS='--shard-size 2097152 --row-group-size 65536' TRAINFLAGS='-N -c 65536'
+ABSEARCH_MODEL="NovaSearch/stella_en_1.5B_v5" TRUST_REMOTE_CODE=1 make -j 4 BUILDFLAGS='-b 32' DUMPFLAGS='--shard-size 2097152 --row-group-size 65536' TRAINFLAGS='-N -c 65536'
 ```
 
 # Syncing

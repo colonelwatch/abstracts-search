@@ -28,6 +28,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
+from utils.env_utils import BF16
 from utils.table_utils import (
     create_embeddings_table, insert_embeddings, to_sql_binary, VectorConverter
 )
@@ -40,7 +41,6 @@ def parse_args() -> Namespace:
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
     parser.add_argument("--row-group-size", default=262144, type=int)  # around 128MB
-    parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     return parser.parse_args()
 
 
@@ -191,7 +191,7 @@ def main() -> int:
     if source.suffix == ".sqlite" and dest.suffix == "":
         dest.mkdir()
         try:
-            dump_database(source, dest, args.shard_size, args.row_group_size, args.bf16)
+            dump_database(source, dest, args.shard_size, args.row_group_size, BF16)
         except (KeyboardInterrupt, Exception):
             rmtree(dest)
             raise

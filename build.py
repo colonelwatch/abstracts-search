@@ -31,6 +31,7 @@ from sentence_transformers import SentenceTransformer
 import torch
 from tqdm import tqdm
 
+from utils.env_utils import MODEL, TRUST_REMOTE_CODE, BF16
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
@@ -40,13 +41,10 @@ DocumentIdBatch = tuple[list[str], list[str]]
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
     parser.add_argument("data_path", type=Path)
-    parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-t", "--tasks", default=2, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
     parser.add_argument("--filter-tasks", default=5, type=int)
     parser.add_argument("--filter-batch-size", default=1024, type=int)
-    parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
-    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
     args = parser.parse_args()
     return args
@@ -277,7 +275,7 @@ def main():
 
     # Get model with file lock to ensure next process will see this one
     with FileLock("/tmp/abstracts-search-gpu.lock"):
-        model = get_model(args.model_name, args.bf16, args.trust_remote_code)
+        model = get_model(MODEL, BF16, TRUST_REMOTE_CODE)
 
     embedding_dim = model.get_sentence_embedding_dimension()
     if embedding_dim is None:
