@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
@@ -204,18 +205,23 @@ def filter_batched(
     n_tasks: int,
     progress: bool,
 ) -> Generator[DocumentIdBatch, None, None]:
-    filtereds: list[tuple[str, str]] = []
+    filtereds: deque[tuple[str, str]] = deque()
 
     def roll(drain: bool):
         nonlocal filtereds
 
         while len(filtereds) >= batch_size or (drain and filtereds):
-            out = filtereds[:batch_size]
-            ids_out = [id_ for id_, _ in out]
-            documents_out = [document for _, document in out]
-            yield ids_out, documents_out
+            ids_out: list[str] = []
+            documents_out: list[str] = []
+            for _ in range(batch_size):
+                try:
+                    id_, document = filtereds.popleft()
+                except IndexError:
+                    break
+                ids_out.append(id_)
+                documents_out.append(document)
 
-            filtereds = filtereds[batch_size:]
+            yield ids_out, documents_out
 
     with tqdm(disable=(not progress)) as count:
         def filt(ids: list[str], documents: list[str]):
