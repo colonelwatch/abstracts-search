@@ -28,7 +28,6 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
-from utils.env_utils import BF16
 from utils.table_utils import (
     create_embeddings_table, insert_embeddings, to_sql_binary, VectorConverter
 )
@@ -104,13 +103,24 @@ def dump_database(
     dest: Path,
     shard_size: int,
     row_group_size: int,
-    bf16: bool,
 ):
     if not (source.suffix == ".sqlite" and dest.suffix == ""):
         raise ValueError("invalid source and dest types")
 
-    # To save RAM, push chunks of row_group_size into shards of shard_size one-by-one
+    # detect the type used in the database
+    with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+        (dtype,) = conn.execute(
+            "SELECT value FROM properties where key = 'dtype'"
+        ).fetchone()
+        if dtype == "bf16":
+            bf16 = True
+        elif dtype == "fp16":
+            bf16 = False
+        else:
+            raise ValueError("database contains an invalid dtype value")
     converter = VectorConverter(bf16)
+
+    # To save RAM, push chunks of row_group_size into shards of shard_size one-by-one
     sqlite3.register_converter("vector", converter.from_sql_binary)
     with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
         # get the dimension by querying the first row and checking its length
@@ -164,7 +174,7 @@ def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with sqlite3.connect(dest) as conn:
-        create_embeddings_table(conn)
+        create_embeddings_table(conn, bf16)
         for batch in dataset.to_batches(batch_size=batch_size):
             embeddings_np: npt.NDArray = (  # this makes the conversion zero-copy
                 batch["embedding"].flatten().to_numpy().reshape((-1, length))
@@ -191,7 +201,7 @@ def main() -> int:
     if source.suffix == ".sqlite" and dest.suffix == "":
         dest.mkdir()
         try:
-            dump_database(source, dest, args.shard_size, args.row_group_size, BF16)
+            dump_database(source, dest, args.shard_size, args.row_group_size)
         except (KeyboardInterrupt, Exception):
             rmtree(dest)
             raise

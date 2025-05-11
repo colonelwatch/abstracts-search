@@ -5,6 +5,8 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from .env_utils import BF16
+
 
 class VectorConverter:
     def __init__(self, bf16: bool):
@@ -26,9 +28,13 @@ def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
     return vect.numpy().data
 
 
-def create_embeddings_table(conn: sqlite3.Connection):
+def create_embeddings_table(conn: sqlite3.Connection, bf16: bool):
     conn.execute(
         "CREATE TABLE embeddings(id TEXT PRIMARY KEY, embedding vector)"
+    )
+    conn.execute("CREATE TABLE properties(key TEXT, value TEXT)")
+    conn.execute(
+        "INSERT INTO properties VALUES(?, ?)", ("dtype", "bf16" if bf16 else "fp16")
     )
 
 
@@ -56,4 +62,4 @@ if __name__ == "__main__":
         print("error: target already exists", file=stderr)
 
     with sqlite3.connect(target) as conn:
-        create_embeddings_table(conn)
+        create_embeddings_table(conn, BF16)
