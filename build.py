@@ -221,11 +221,9 @@ def filter_batched(
             del batch[id_]
         return batch
 
-    with tqdm() as c:
-        for filtered in imap(batches, filt, n_tasks):
-            c.update(FILTER_BATCH_SIZE)
-            filtereds.extend(filtered.items())
-            yield from roll(False)
+    for filtered in imap(batches, filt, n_tasks):
+        filtereds.extend(filtered.items())
+        yield from roll(False)
     yield from roll(True)
 
 
