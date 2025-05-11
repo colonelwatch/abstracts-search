@@ -33,7 +33,7 @@ Building of `abstracts-embeddings` was done on a Google Cloud machine with four 
 
 There are two ways to build the index: from the `abstracts-embeddings` (with sync) or from scratch, using the OpenAlex S3 bucket.
 
-Either way, make sure `aws` (AWS CLI), `git-lfs`, `mbuffer`, and `conda` are available, and make sure Git over SSH is set up. Then, start with the following setup.
+Either way, make sure `aws` (AWS CLI), `jq`, `git-lfs`, `mbuffer`, and `conda` are available, and make sure Git over SSH is set up. Then, start with the following setup.
 
 ```
 sudo nvidia-persistenced

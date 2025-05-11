@@ -17,14 +17,13 @@ abstracts-embeddings/data abstracts-embeddings/events &: | $(events)
 
 # in theory, wouldn't I need to handle two objects in one line here? I could probably
 # update oa_jsonl to handle that?
-# consider downloading the files via curl instead of aws s3 cp, even if we keep s3 ls?
 EQ := =
-events/updated_date$(EQ)% : | oa_jsonl data.sqlite events
-	d="s3://openalex/data/works/$(subst events/,,$@)"; 			\
-	aws s3 ls --no-sign-request "$$d/" | 					\
-		sed -E "s|.* +(.*)|$$d/\1|" | 					\
-		xargs -I % -- aws s3 cp --no-sign-request % - | 		\
-		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 			\
+events/updated_date$(EQ)% : | manifest.txt oa_jsonl data.sqlite events
+	s3_base="s3://openalex/data/works"; 				\
+	http_base="https://openalex.s3.amazonaws.com/data/works"; 	\
+	grep "$(subst events/,,$@)" manifest.txt | 			\
+		sed "s|$$s3_base|$$http_base|" | xargs -- curl -s | 	\
+		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 		\
 		$(PYTHON) ./build.py $(BUILDFLAGS) data.sqlite
 	touch $@
 
@@ -37,26 +36,24 @@ data.sqlite:
 events:
 	mkdir events
 
-# consider using curl for the manifest then learning to use a JSON query tool
 # warn if the we're within a day after manifest update or 20 days out, then allow the
 # user to ctrl+C within a short amount of time? Can I get the manifest time form
 # HTTP headers, or will I need to bring in the pull parse pattern after all?
 FORCE:
-remote_targets.mk: FORCE
-	tgts="$$(mktemp)"; 							\
-	echo "events = \\" >> $$tgts; 						\
-	for p in $$( 								\
-		aws s3 ls --no-sign-request "s3://openalex/data/works/" | 	\
-		sed -E "s|.* +(.*)|\1|" 					\
-	); do 									\
-		if [[ "$$p" == "manifest" ]]; then 				\
-			continue; 						\
-		fi; 								\
-		echo "events/$${p%/} \\" | sed -e "s/=/\$$\(EQ\)/" >> $$tgts; 	\
-	done; 									\
-	cmp -s "$$tgts" $@; 							\
-	if [[ $$? != 0 ]]; then 						\
-		mv $$tgts $@; 							\
+remote_targets.mk manifest.txt &: FORCE
+	tmp=$$(mktemp); 							\
+	curl -s "https://openalex.s3.amazonaws.com/data/works/manifest" | 	\
+		jq -r .entries[].url | sort > "$$tmp"; 				\
+	if ! cmp -s "$$tmp" manifest.txt; then 					\
+		mv "$$tmp" manifest.txt;					\
+	fi
+
+	tmp=$$(mktemp); 						\
+	echo "events = \\" > "$$tmp" && sed -E 				\
+		-e 's|.*/works/(.*)/part_[0-9]+.gz|events/\1 \\|' 	\
+		-e 's/=/$$(EQ)/' manifest.txt | uniq >> "$$tmp"; 	\
+	if ! cmp -s "$$tmp" remote_targets.mk; then 			\
+		mv "$$tmp" remote_targets.mk; 				\
 	fi
 
 .PHONY: recover
