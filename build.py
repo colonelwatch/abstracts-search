@@ -33,9 +33,6 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
-FILTER_BATCH_SIZE = 1024  # distinct from batch size passed to encoding model
-FILTER_TASK_COUNT = 5  # database queries are not CPU bound
-
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
@@ -43,6 +40,8 @@ def parse_args() -> Namespace:
     parser.add_argument("-m", "--model-name", default="all-MiniLM-L6-v2")
     parser.add_argument("-t", "--tasks", default=2, type=int)
     parser.add_argument("-b", "--batch-size", default=256, type=int)
+    parser.add_argument("--filter-tasks", default=5, type=int)
+    parser.add_argument("--filter-batch-size", default=1024, type=int)
     parser.add_argument("--fp16", action="store_false", dest="bf16")  # fp16 or bf16
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("-P", "--progress", action="store_true")
@@ -279,10 +278,10 @@ def main():
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with (
-        OaJsonlBatched(FILTER_BATCH_SIZE) as batches,
+        OaJsonlBatched(args.filter_batch_size) as batches,
         SharedConnection(args.data_path) as conn
     ):
-        batches = filter_batched(batches, conn, args.batch_size, FILTER_TASK_COUNT)
+        batches = filter_batched(batches, conn, args.batch_size, args.filter_tasks)
         batches = encode_pipelined(batches, model, args.tasks, args.progress)
         for ids_batch, embeddings_batch in batches:
             conn.insert_async(ids_batch, embeddings_batch)
