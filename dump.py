@@ -19,7 +19,7 @@ from pathlib import Path
 from shutil import rmtree
 import sqlite3
 from sys import stderr
-from typing import Generator
+from typing import Generator, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -28,6 +28,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import torch
 
+from utils.env_utils import BF16
 from utils.table_utils import (
     create_embeddings_table, insert_embeddings, to_sql_binary, VectorConverter
 )
@@ -40,6 +41,9 @@ def parse_args() -> Namespace:
     parser.add_argument("-b", "--batch-size", default=1024, type=int)
     parser.add_argument("-s", "--shard-size", default=4194304, type=int)  # under 4GB
     parser.add_argument("--row-group-size", default=262144, type=int)  # around 128MB
+    parser.add_argument(
+        "--no-enforce-dtype", action="store_false", dest="enforce_dtype"
+    )
     return parser.parse_args()
 
 
@@ -103,6 +107,7 @@ def dump_database(
     dest: Path,
     shard_size: int,
     row_group_size: int,
+    enforce: Literal["bf16", "fp16"] | None = None,
 ):
     if not (source.suffix == ".sqlite" and dest.suffix == ""):
         raise ValueError("invalid source and dest types")
@@ -118,10 +123,13 @@ def dump_database(
             bf16 = False
         else:
             raise ValueError("database contains an invalid dtype value")
-    converter = VectorConverter(bf16)
+
+    # VectorConverter does torch.bfloat16 to np.float32
+    to_dtype = "fp32" if enforce == "bf16" else enforce
+    converter = VectorConverter(bf16, to_dtype)
+    sqlite3.register_converter("vector", converter.from_sql_binary)
 
     # To save RAM, push chunks of row_group_size into shards of shard_size one-by-one
-    sqlite3.register_converter("vector", converter.from_sql_binary)
     with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
         # get the dimension by querying the first row and checking its length
         embedding = conn.execute("SELECT embedding FROM embeddings LIMIT 1")
@@ -155,22 +163,30 @@ def dump_database(
                 write_to_parquet(ids_chunk, embd_chunk, shard)
 
 
-def dump_dataset(source: Path, dest: Path, batch_size: int) -> ds.Dataset:
+def dump_dataset(
+    source: Path,
+    dest: Path,
+    batch_size: int,
+    enforce: Literal["bf16", "fp16"] | None = None,
+) -> ds.Dataset:
     if not (source.suffix == "" and dest.suffix == ".sqlite"):
         raise ValueError("invalid source and dest types")
 
     paths = [str(path) for path in source.glob("*.parquet")]
     dataset: ds.Dataset = ds.dataset(paths)
 
-    embeddings_col_type = dataset.schema.field("embedding").type
-    length = embeddings_col_type.list_size  # poorly documented!
-    dtype = embeddings_col_type.value_type
-    if dtype == pa.float32():
-        bf16 = True  # assume this was converted from bfloat16, otherwise this truncates
-    elif dtype == pa.float16():
-        bf16 = False
+    if not enforce:
+        embeddings_col_type = dataset.schema.field("embedding").type
+        length = embeddings_col_type.list_size  # poorly documented!
+        dtype = embeddings_col_type.value_type
+        if dtype == pa.float32():
+            bf16 = True  # assume this was converted from bfloat16
+        elif dtype == pa.float16():
+            bf16 = False
+        else:
+            raise ValueError(f'invalid embeddings type "{dtype}"')
     else:
-        raise ValueError(f'invalid embeddings type "{dtype}"')
+        bf16 = True if enforce == "bf16" else False
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with sqlite3.connect(dest) as conn:
@@ -198,16 +214,21 @@ def main() -> int:
         print(f'error: destination path "{dest}" exists', file=stderr)
         return 1
 
+    if args.enforce_dtype:
+        enforce = "bf16" if BF16 else "fp16"
+    else:
+        enforce = None
+
     if source.suffix == ".sqlite" and dest.suffix == "":
         dest.mkdir()
         try:
-            dump_database(source, dest, args.shard_size, args.row_group_size)
+            dump_database(source, dest, args.shard_size, args.row_group_size, enforce)
         except (KeyboardInterrupt, Exception):
             rmtree(dest)
             raise
     elif source.suffix == "" and dest.suffix == ".sqlite":
         try:
-            dump_dataset(source, dest, args.batch_size)
+            dump_dataset(source, dest, args.batch_size, enforce)
         except (KeyboardInterrupt, Exception):
             dest.unlink()
             raise

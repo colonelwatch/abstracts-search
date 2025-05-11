@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Iterable
+from typing import Iterable, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -9,16 +9,21 @@ from .env_utils import BF16
 
 
 class VectorConverter:
-    def __init__(self, bf16: bool):
+    def __init__(self, bf16: bool, to_dtype: Literal["fp32", "fp16"] | None):
         self.bf16 = bf16  # else fp16
+        self.to_dtype = to_dtype
 
     def from_sql_binary(self, val: bytes) -> npt.NDArray:
-        if self.bf16:  # do bf16 -> fp32 (TODO: do this with pure numpy code?)
+        if self.bf16:   # do bf16 -> fp32/16 (TODO: do this with pure numpy code?)
             arr = np.frombuffer(val, dtype=np.uint16)
             t = torch.tensor(arr.copy())  # PyTorch complains about read-only memory
-            arr = t.view(torch.bfloat16).float().numpy()
+            arr = t.view(torch.bfloat16)
+            arr = t.half() if self.to_dtype == "fp16" else t.float()
+            arr = t.numpy()
         else:
             arr = np.frombuffer(val, dtype=np.float16)
+            if self.to_dtype == "fp32":
+                arr = arr.astype(np.float32)
         return arr
 
 
