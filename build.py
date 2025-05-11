@@ -200,6 +200,7 @@ def filter_batched(
     conn: SharedConnection,
     batch_size: int,
     n_tasks: int,
+    progress: bool,
 ) -> Generator[tuple[list[str], list[str]], None, None]:
     filtereds: list[tuple[str, str]] = []
 
@@ -214,16 +215,18 @@ def filter_batched(
 
             filtereds = filtereds[batch_size:]
 
-    def filt(ids: list[str], documents: list[str]):
-        batch = {id_: document for id_, document in zip(ids, documents)}
-        for id_ in conn.pick_existing(ids):
-            del batch[id_]
-        return batch
+    with tqdm(disable=(not progress)) as count:
+        def filt(ids: list[str], documents: list[str]):
+            batch = {id_: document for id_, document in zip(ids, documents)}
+            for id_ in conn.pick_existing(ids):
+                del batch[id_]
+            count.update(len(ids))  # update counter with the unfiltered count
+            return batch
 
-    for filtered in imap(batches, filt, n_tasks):
-        filtereds.extend(filtered.items())
-        yield from roll(False)
-    yield from roll(True)
+        for filtered in imap(batches, filt, n_tasks):
+            filtereds.extend(filtered.items())
+            yield from roll(False)
+        yield from roll(True)
 
 
 # built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
@@ -250,18 +253,15 @@ def encode_pipelined(
     batches: Iterable[tuple[list[str], list[str]]],
     model: SentenceTransformer,
     n_tasks: int,
-    progress: bool,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
-    with tqdm(disable=(not progress)) as count:
-        ids_batches, documents_batches = iunzip(batches, 2)
-        documents_batches = iunsqueeze(documents_batches)
-        embeddings_batches = imap(
-            documents_batches, lambda x: encode_faster(model, x), n_tasks
-        )
-        batches_out = zip(ids_batches, embeddings_batches)
-        for ids_batch, embeddings_batch in batches_out:
-            count.update(len(embeddings_batch))
-            yield ids_batch, embeddings_batch
+    ids_batches, documents_batches = iunzip(batches, 2)
+    documents_batches = iunsqueeze(documents_batches)
+    embeddings_batches = imap(
+        documents_batches, lambda x: encode_faster(model, x), n_tasks
+    )
+    batches_out = zip(ids_batches, embeddings_batches)
+    for ids_batch, embeddings_batch in batches_out:
+        yield ids_batch, embeddings_batch
 
 
 def main():
@@ -281,8 +281,10 @@ def main():
         OaJsonlBatched(args.filter_batch_size) as batches,
         SharedConnection(args.data_path) as conn
     ):
-        batches = filter_batched(batches, conn, args.batch_size, args.filter_tasks)
-        batches = encode_pipelined(batches, model, args.tasks, args.progress)
+        batches = filter_batched(
+            batches, conn, args.batch_size, args.filter_tasks, args.progress
+        )
+        batches = encode_pipelined(batches, model, args.tasks)
         for ids_batch, embeddings_batch in batches:
             conn.insert_async(ids_batch, embeddings_batch)
 
