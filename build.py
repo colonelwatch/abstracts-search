@@ -33,6 +33,8 @@ from tqdm import tqdm
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
+DocumentIdBatch = tuple[list[str], list[str]]
+
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("build.py", description="Embeds titles and abstracts.")
@@ -95,7 +97,7 @@ class OaJsonlBatched:
     def __init__(self, batch_size: int) -> None:
         self._batch_size = batch_size
         self._worker = Thread(target=self._load_routine)
-        self._queue: queue.Queue[tuple[list[str], list[str]] | None] = queue.Queue(3)
+        self._queue: queue.Queue[DocumentIdBatch | None] = queue.Queue(3)
         self._halt = Event()
 
     def start(self) -> None:
@@ -112,7 +114,7 @@ class OaJsonlBatched:
     def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
         self.stop()
 
-    def __iter__(self) -> Generator[tuple[list[str], list[str]], None, None]:
+    def __iter__(self) -> Generator[DocumentIdBatch, None, None]:
         while True:
             batch = self._queue.get()
             if batch is None:
@@ -196,12 +198,12 @@ class SharedConnection:
 
 
 def filter_batched(
-    batches: Iterable[tuple[list[str], list[str]]],
+    batches: Iterable[DocumentIdBatch],
     conn: SharedConnection,
     batch_size: int,
     n_tasks: int,
     progress: bool,
-) -> Generator[tuple[list[str], list[str]], None, None]:
+) -> Generator[DocumentIdBatch, None, None]:
     filtereds: list[tuple[str, str]] = []
 
     def roll(drain: bool):
@@ -250,7 +252,7 @@ def encode_faster(
 
 
 def encode_pipelined(
-    batches: Iterable[tuple[list[str], list[str]]],
+    batches: Iterable[DocumentIdBatch],
     model: SentenceTransformer,
     n_tasks: int,
 ) -> Generator[tuple[list[str], torch.Tensor], None, None]:
