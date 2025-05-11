@@ -23,7 +23,7 @@ events/updated_date$(EQ)% : | manifest.txt oa_jsonl data.sqlite events
 	http_base="https://openalex.s3.amazonaws.com/data/works"; 	\
 	grep "$(subst events/,,$@)" manifest.txt | 			\
 		sed "s|$$s3_base|$$http_base|" | xargs -- curl -s | 	\
-		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 		\
+		gunzip | ./oa_jsonl | 					\
 		$(PYTHON) ./build.py $(BUILDFLAGS) data.sqlite
 	touch $@
 
