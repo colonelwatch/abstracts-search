@@ -17,11 +17,13 @@
 from argparse import ArgumentParser, Namespace
 from concurrent.futures import ThreadPoolExecutor
 import json
+import queue
 from pathlib import Path
 import sys
 from subprocess import Popen, PIPE
 import sqlite3
-from typing import TextIO, BinaryIO, Iterable, Generator, Self
+from threading import Thread, Event
+from typing import cast, TextIO, Iterable, Generator, Self
 
 from filelock import FileLock
 from sentence_transformers import SentenceTransformer
@@ -90,23 +92,56 @@ def get_model(
     return model
 
 
-def load_oajsonl_batched(
-    f: TextIO | BinaryIO, batch_size: int
-) -> Generator[tuple[list[str], list[str]], None, None]:
-    ids_batch: list[str] = []
-    documents_batch: list[str] = []
-    for line in f:
-        row = json.loads(line)
+class OaJsonlBatched:
+    def __init__(self, batch_size: int) -> None:
+        self._batch_size = batch_size
+        self._worker = Thread(target=self._load_routine)
+        self._queue: queue.Queue[tuple[list[str], list[str]] | None] = queue.Queue(3)
+        self._halt = Event()
 
-        ids_batch.append(row["id"])
-        documents_batch.append(row["document"])
-        if len(documents_batch) >= batch_size:
-            yield ids_batch, documents_batch
-            ids_batch = []
-            documents_batch = []
+    def start(self) -> None:
+        self._worker.start()
 
-    if documents_batch:
-        yield ids_batch, documents_batch
+    def stop(self) -> None:
+        self._halt.set()
+        self._worker.join()
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
+        self.stop()
+
+    def __iter__(self) -> Generator[tuple[list[str], list[str]], None, None]:
+        while True:
+            batch = self._queue.get()
+            if batch is None:
+                break
+            yield batch
+
+    def _load_routine(self):
+        stdin_cast = cast(TextIO, sys.stdin)
+        
+        ids_batch: list[str] = []
+        documents_batch: list[str] = []
+        for line in stdin_cast.buffer:
+            row = json.loads(line)
+
+            ids_batch.append(row["id"])
+            documents_batch.append(row["document"])
+            if len(documents_batch) >= self._batch_size:
+                self._queue.put((ids_batch, documents_batch))
+                ids_batch = []
+                documents_batch = []
+
+            if self._halt.is_set():
+                return
+
+        if documents_batch:
+            self._queue.put((ids_batch, documents_batch))
+
+        self._queue.put(None)
 
 
 class SharedConnection:
@@ -186,9 +221,11 @@ def filter_batched(
             del batch[id_]
         return batch
 
-    for filtered in imap(batches, filt, n_tasks):
-        filtereds.extend(filtered.items())
-        yield from roll(False)
+    with tqdm() as c:
+        for filtered in imap(batches, filt, n_tasks):
+            c.update(FILTER_BATCH_SIZE)
+            filtereds.extend(filtered.items())
+            yield from roll(False)
     yield from roll(True)
 
 
@@ -243,8 +280,10 @@ def main():
         exit(1)
 
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
-    with SharedConnection(args.data_path) as conn:
-        batches = load_oajsonl_batched(sys.stdin.buffer, FILTER_BATCH_SIZE)
+    with (
+        OaJsonlBatched(FILTER_BATCH_SIZE) as batches,
+        SharedConnection(args.data_path) as conn
+    ):
         batches = filter_batched(batches, conn, args.batch_size, FILTER_TASK_COUNT)
         batches = encode_pipelined(batches, model, args.tasks, args.progress)
         for ids_batch, embeddings_batch in batches:
