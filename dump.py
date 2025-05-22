@@ -175,10 +175,12 @@ def dump_dataset(
     paths = [str(path) for path in source.glob("*.parquet")]
     dataset: ds.Dataset = ds.dataset(paths)
 
+    # extract the vector dtype and length from the schema
+    embeddings_col_type = dataset.schema.field("embedding").type
+    dtype = embeddings_col_type.value_type
+    length = embeddings_col_type.list_size  # poorly documented!
+
     if not enforce:
-        embeddings_col_type = dataset.schema.field("embedding").type
-        length = embeddings_col_type.list_size  # poorly documented!
-        dtype = embeddings_col_type.value_type
         if dtype == pa.float32():
             bf16 = True  # assume this was converted from bfloat16
         elif dtype == pa.float16():
