@@ -6,10 +6,10 @@ PYTHON := conda run -n abstracts-search --live-stream python
 CFLAGS ?= -O2
 BUILDFLAGS ?=
 DUMPFLAGS ?=
-TRAINFLAGS ?=
+INDEXFLAGS ?=
 
 abstracts-faiss/index: abstracts-embeddings/data
-	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@
+	$(PYTHON) ./index.py train $(INDEXFLAGS) $< $@
 
 include remote_targets.mk
 EQ := =
