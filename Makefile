@@ -1,10 +1,12 @@
+-include env.mk
+
 SHELL := bash
 PYTHON := conda run -n abstracts-search --live-stream python
 
-CFLAGS := -O2
-BUILDFLAGS :=
-DUMPFLAGS :=
-TRAINFLAGS :=
+CFLAGS ?= -O2
+BUILDFLAGS ?=
+DUMPFLAGS ?=
+TRAINFLAGS ?=
 
 abstracts-faiss/index: abstracts-embeddings/data
 	$(PYTHON) ./train.py train $(TRAINFLAGS) $< $@

@@ -5,3 +5,4 @@ remote_targets.mk
 .vscode
 oa_jsonl
 __pycache__
+env.mk
