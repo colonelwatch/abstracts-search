@@ -19,13 +19,12 @@ from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from shutil import rmtree, copy
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Generator, Literal, TypedDict
+from typing import Any, Generator, Literal, TypedDict
 import warnings
 
 from datasets import Dataset, disable_progress_bars, disable_caching
@@ -55,17 +54,6 @@ class IndexParameters(TypedDict):
     recall: float  # in this case 10-recall@10
     exec_time: float  # seconds (raw faiss measure is in milliseconds)
     param_string: str  # pass directly to faiss index
-
-
-def get_env_var[T, U](
-    key: str, type_: Callable[[str], T] = str, default: U = None
-) -> T | U:
-    var = os.getenv(key)
-    if var is not None:
-        var = type_(var)
-    else:
-        var = default
-    return var
 
 
 def parse_args() -> Namespace:
