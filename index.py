@@ -510,8 +510,8 @@ def tune_index(
 
 
 def save_ids(path: Path, dataset: Dataset):
-    # the columns themselves aren't needed to run the index
-    dataset.remove_columns("embedding").to_parquet(path, BATCH_SIZE, compression="lz4")
+    # only the id column is needed to run the index
+    dataset.select_columns("id").to_parquet(path, BATCH_SIZE, compression="lz4")
 
 
 def save_optimal_params(
