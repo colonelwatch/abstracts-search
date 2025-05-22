@@ -603,6 +603,7 @@ def main():
 
         args.dest.mkdir()
         try:
+            copy(trained_path, args.dest / "empty.faiss")
             save_ids(args.dest / "ids.parquet", dataset)
             save_optimal_params(
                 args.dest / "params.json",
