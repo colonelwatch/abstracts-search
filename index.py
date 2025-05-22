@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from argparse import ArgumentParser, Namespace
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
 import json
@@ -24,7 +25,7 @@ from pathlib import Path
 from shutil import rmtree, copy
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Literal, TypedDict
+from typing import Any, Iterable, Generator, Literal, TypedDict
 import warnings
 
 from datasets import Dataset, disable_progress_bars, disable_caching
@@ -116,9 +117,6 @@ class TrainArgs:
         if not self.source.exists():
             raise ValueError(f'source path "{self.source}" does not exist')
 
-        if self.dest.exists():
-            raise ValueError(f'destination path "{self.dest}" exists')
-
         if self.dimensions is not None and not self.normalize:
             self.normalize = True
             warnings.warn("inferring --normalize from --dimension")
@@ -140,6 +138,18 @@ class TrainArgs:
         else:
             self.one_recall_at_one = False
             self.k = self.intersection
+
+
+@contextmanager
+def del_on_exc(path: Path | Iterable[Path]) -> Generator[None, None, None]:
+    paths = [path] if isinstance(path, Path) else path
+    try:
+        yield
+    except (KeyboardInterrupt, Exception):
+        for p in paths:
+            if p.exists:
+                rmtree(p)
+        raise
 
 
 def load_dataset(dir: Path) -> Dataset:
@@ -302,22 +312,22 @@ def create_memmap(
             embeddings = torch.nn.functional.normalize(embeddings)
         return embeddings
 
+    i = 0
     memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
-    try:
+    with (
+        del_on_exc(cache_path),
+        tqdm(
+            desc="create_memmap", total=len(dataset), disable=(not args.progress)
+        ) as counter
+    ):
         batches = iter_tensors(dataset)
         batches = imap(batches, preproc, -1)
-        with tqdm(
-            desc="create_memmap", total=len(dataset), disable=(not args.progress)
-        ) as counter:
-            i = 0  # save batches to disk by assigning to memmap slices
-            for embeddings_batch in batches:
-                n_batch = len(embeddings_batch)
-                memmap[i:(i + n_batch)] = embeddings_batch.numpy()
-                i += n_batch
-                counter.update(n_batch)
-    except (KeyboardInterrupt, Exception):
-        cache_path.unlink()
-        raise
+        for embeddings_batch in batches:
+            # save batches to disk by assigning to memmap slices
+            n_batch = len(embeddings_batch)
+            memmap[i:(i + n_batch)] = embeddings_batch.numpy()
+            i += n_batch
+            counter.update(n_batch)
 
     # flush from RAM to disk, then destroy the object on RAM and recreate from disk
     memmap.flush()
@@ -601,20 +611,24 @@ def main():
         merged_index = open_ondisk(tmpdir)
         optimal_params = tune_index(merged_index, ground_truth, args)
 
-        args.dest.mkdir()
-        try:
-            copy(trained_path, args.dest / "empty.faiss")
-            save_ids(args.dest / "ids.parquet", dataset)
+        if not args.dest.exists():
+            args.dest.mkdir()
+
+        # TODO: make make_index take direct paths?
+        trained_dest_path = args.dest / "empty.faiss"
+        ids_path = args.dest / "ids.parquet"
+        params_path = args.dest / "params.json"
+        index_paths = [args.dest / "index.faiss", args.dest / "ondisk.ivfdata"]
+        with del_on_exc([trained_dest_path, ids_path, params_path, *index_paths]):
+            copy(trained_path, trained_dest_path)
+            save_ids(ids_path, dataset)
             save_optimal_params(
-                args.dest / "params.json",
+                params_path,
                 args.dimensions,
                 args.normalize,
                 optimal_params
             )
             make_index(args.dest, trained_path, dataset, None, CACHE, args)
-        except (KeyboardInterrupt, Exception):
-            rmtree(args.dest)
-            raise
 
 
 if __name__ == "__main__":
