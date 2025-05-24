@@ -589,19 +589,8 @@ def main():
     if not args.progress:
         disable_progress_bars()
 
+    # prepare source dataset and destination directory
     dataset = load_dataset(args.source)
-
-    if args.clusters is None:
-        clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
-    else:
-        clusters = args.clusters
-    factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
-    train_size = TRAIN_SIZE_MULTIPLE * clusters
-
-    splits = dataset.train_test_split(args.queries, train_size, seed=42)
-    train = splits["train"]
-    queries = splits["test"]
-
     if not args.dest.exists():
         args.dest.mkdir()
 
@@ -609,6 +598,18 @@ def main():
     trained_dest_path = args.dest / "empty.faiss"
     params_path = args.dest / "params.json"
     if not trained_dest_path.exists() and params_path.exists():
+        # extract a "train" set and a "test" set, which is actually ground-truth
+        # queries to be held out from the making of a provisional index
+        if args.clusters is None:
+            clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
+        else:
+            clusters = args.clusters
+        factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
+        train_size = TRAIN_SIZE_MULTIPLE * clusters
+        splits = dataset.train_test_split(args.queries, train_size, seed=42)
+        train = splits["train"]
+        queries = splits["test"]
+
         with TemporaryDirectory(dir=CACHE) as tmpdir:
             tmpdir = Path(tmpdir)
             working_dir = CACHE if args.use_cache else tmpdir
