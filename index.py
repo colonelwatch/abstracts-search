@@ -147,8 +147,12 @@ def del_on_exc(path: Path | Iterable[Path]) -> Generator[None, None, None]:
         yield
     except (KeyboardInterrupt, Exception):
         for p in paths:
-            if p.exists:
+            if not p.exists():
+                continue
+            if p.is_dir():
                 rmtree(p)
+            else:
+                p.unlink()
         raise
 
 
