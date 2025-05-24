@@ -567,6 +567,62 @@ def clean_cache(args: CleanArgs, cache_dir: Path):
                 lock.unlink()
 
 
+def ensure_trained(dataset: Dataset, args: TrainArgs) -> tuple[Path, Path]:
+    trained_dest_path = args.dest / "empty.faiss"
+    params_path = args.dest / "params.json"
+    if trained_dest_path.exists() and params_path.exists():
+        return trained_dest_path, params_path
+
+    # extract a "train" set and a "test" set, which is actually ground-truth
+    # queries to be held out from the making of a provisional index
+    if args.clusters is None:
+        clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
+    else:
+        clusters = args.clusters
+    factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
+    train_size = TRAIN_SIZE_MULTIPLE * clusters
+    splits = dataset.train_test_split(args.queries, train_size, seed=42)
+    train = splits["train"]
+    queries = splits["test"]
+
+    # train index and Pareto-optimal params from splits
+    with TemporaryDirectory(dir=CACHE) as tmpdir:
+        tmpdir = Path(tmpdir)
+        working_dir = CACHE if args.use_cache else tmpdir
+
+        ground_truth = make_ground_truth(dataset, queries, working_dir, args)
+        trained_path = train_index(train, factory_string, working_dir, args)
+
+        with queries.formatted_as("torch"):
+            q_ids: torch.Tensor = queries["index"]  # type: ignore
+        make_index(tmpdir, trained_path, dataset, q_ids, working_dir, args)
+        merged_index = open_ondisk(tmpdir)
+        optimal_params = tune_index(merged_index, ground_truth, args)
+
+        with del_on_exc([trained_dest_path, params_path]):
+            copy(trained_path, trained_dest_path)
+            save_optimal_params(
+                params_path,
+                args.dimensions,
+                args.normalize,
+                optimal_params
+            )
+    
+    return trained_dest_path, params_path
+
+
+def ensure_filled(
+    dataset: Dataset, trained_path: Path, args: TrainArgs
+) -> tuple[Path, Path, Path]:
+    # TODO: make make_index take index_paths entries?
+    ids_path = args.dest / "ids.parquet"
+    index_paths = (args.dest / "index.faiss", args.dest / "ondisk.ivfdata")
+    with del_on_exc([ids_path, *index_paths]):
+        save_ids(ids_path, dataset)
+        make_index(args.dest, trained_path, dataset, None, CACHE, args)
+    return ids_path, *index_paths
+
+
 def main():
     args = parse_args()
 
@@ -594,52 +650,8 @@ def main():
     if not args.dest.exists():
         args.dest.mkdir()
 
-    # train index and Pareto-optimal params from splits, or skip if they exist
-    trained_dest_path = args.dest / "empty.faiss"
-    params_path = args.dest / "params.json"
-    if not trained_dest_path.exists() and params_path.exists():
-        # extract a "train" set and a "test" set, which is actually ground-truth
-        # queries to be held out from the making of a provisional index
-        if args.clusters is None:
-            clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
-        else:
-            clusters = args.clusters
-        factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
-        train_size = TRAIN_SIZE_MULTIPLE * clusters
-        splits = dataset.train_test_split(args.queries, train_size, seed=42)
-        train = splits["train"]
-        queries = splits["test"]
-
-        with TemporaryDirectory(dir=CACHE) as tmpdir:
-            tmpdir = Path(tmpdir)
-            working_dir = CACHE if args.use_cache else tmpdir
-
-            ground_truth = make_ground_truth(dataset, queries, working_dir, args)
-            trained_path = train_index(train, factory_string, working_dir, args)
-
-            with queries.formatted_as("torch"):
-                q_ids: torch.Tensor = queries["index"]  # type: ignore
-            make_index(tmpdir, trained_path, dataset, q_ids, working_dir, args)
-            merged_index = open_ondisk(tmpdir)
-            optimal_params = tune_index(merged_index, ground_truth, args)
-
-            with del_on_exc([trained_dest_path, params_path]):
-                copy(trained_path, trained_dest_path)
-                save_optimal_params(
-                    params_path,
-                    args.dimensions,
-                    args.normalize,
-                    optimal_params
-                )
-    else:
-        trained_path = trained_dest_path
-
-    # TODO: make make_index take direct paths?
-    ids_path = args.dest / "ids.parquet"
-    index_paths = [args.dest / "index.faiss", args.dest / "ondisk.ivfdata"]
-    with del_on_exc([ids_path, *index_paths]):
-        save_ids(ids_path, dataset)
-        make_index(args.dest, trained_path, dataset, None, CACHE, args)
+    trained_path, _ = ensure_trained(dataset, args)
+    _ = ensure_filled(dataset, trained_path, args)
 
 
 if __name__ == "__main__":
