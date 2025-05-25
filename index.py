@@ -57,6 +57,12 @@ class IndexParameters(TypedDict):
     param_string: str  # pass directly to faiss index
 
 
+class Params(TypedDict):
+    dimensions: int | None
+    normalize: bool
+    optimal_params: list[IndexParameters]
+
+
 def parse_args() -> Namespace:
     parser = ArgumentParser("train.py", "Trains the FAISS index.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -492,10 +498,10 @@ def tune_index(
         criterion = faiss.IntersectionCriterion(len(ground_truth), args.k)
     criterion.set_groundtruth(None, gt_ids_int64)  # type: ignore (monkey-patched)
 
-    params = faiss.ParameterSpace()
-    params.verbose = args.progress
-    params.initialize(filled_index)
-    results: faiss.OperatingPoints = params.explore(  # type: ignore (monkey-patched)
+    p_space = faiss.ParameterSpace()
+    p_space.verbose = args.progress
+    p_space.initialize(filled_index)
+    results: faiss.OperatingPoints = p_space.explore(  # type: ignore (monkey-patched)
         filled_index, q, criterion
     )
 
@@ -516,17 +522,15 @@ def save_ids(path: Path, dataset: Dataset):
     dataset.select_columns("id").to_parquet(path, BATCH_SIZE, compression="lz4")
 
 
-def save_optimal_params(
+def save_params(
     path: Path,
     dimensions: int | None,
     normalize: bool,
     optimal_params: list[IndexParameters]
 ):
-    params = {
-        "dimensions": dimensions,
-        "normalize": normalize,
-        "optimal_params": optimal_params
-    }
+    params = Params(
+        dimensions=dimensions, normalize=normalize, optimal_params=optimal_params
+    )
     with open(path, "w") as f:
         json.dump(params, f, indent=4)
 
@@ -601,7 +605,7 @@ def ensure_trained(dataset: Dataset, args: TrainArgs) -> tuple[Path, Path]:
 
         with del_on_exc([trained_dest_path, params_path]):
             copy(trained_path, trained_dest_path)
-            save_optimal_params(
+            save_params(
                 params_path,
                 args.dimensions,
                 args.normalize,
