@@ -1,3 +1,6 @@
+DATA_DIR := abstracts-embeddings/data
+INDEX_DIR := abstracts-faiss/index
+
 -include env.mk
 
 SHELL := bash
@@ -6,15 +9,20 @@ PYTHON := conda run -n abstracts-search --live-stream python
 CFLAGS ?= -O2
 BUILDFLAGS ?=
 DUMPFLAGS ?=
-INDEXFLAGS ?=
+INDEXTRAINFLAGS ?=
+INDEXFILLFLAGS ?=
 
-abstracts-faiss/index: abstracts-embeddings/data
-	$(PYTHON) ./index.py train $(INDEXFLAGS) $< $@
+# TODO: deal with this excessively complicated rule
+$(INDEX_DIR)/ids.parquet $(INDEX_DIR)/index.faiss $(INDEX_DIR)/ondisk.ivfdata &: $(DATA_DIR) | $(INDEX_DIR)/empty.faiss $(INDEX_DIR)/empty.faiss
+	$(PYTHON) ./index.py fill $(INDEXFILLFLAGS) $< $(INDEX_DIR)
+
+$(INDEX_DIR)/empty.faiss $(INDEX_DIR)/params.json &: $(DATA_DIR)
+	$(PYTHON) ./index.py train $(INDEXTRAINFLAGS) $< $(INDEX_DIR)
 
 include remote_targets.mk
 EQ := =
-abstracts-embeddings/data abstracts-embeddings/events &: | $(events)
-	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite abstracts-embeddings/data
+$(DATA_DIR) abstracts-embeddings/events &: | $(events)
+	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
 
 # in theory, wouldn't I need to handle two objects in one line here? I could probably
@@ -61,15 +69,15 @@ manifest.txt: FORCE
 
 .PHONY: recover
 recover:
-	$(PYTHON) ./dump.py $(DUMPFLAGS) abstracts-embeddings/data data.sqlite
+	$(PYTHON) ./dump.py $(DUMPFLAGS) $(DATA_DIR) data.sqlite
 	cp -r abstracts-embeddings/events ./
 
 .PHONY: clean
 clean:
 	conda run -n abstracts-search --live-stream python train.py clean
 	rm -rf events
-	rm -rf abstracts-embeddings/data
-	rm -rf abstracts-index/index
+	rm -rf $(DATA_DIR)
+	rm -rf $(INDEX_DIR)
 	rm -f data.sqlite
 	rm -f remote_targets.mk
 	rm -f oa_jsonl

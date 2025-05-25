@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from argparse import ArgumentParser, Namespace
+from abc import abstractmethod
+from argparse import ArgumentParser, Namespace, _SubParsersAction
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
@@ -25,7 +26,7 @@ from pathlib import Path
 from shutil import rmtree, copy
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Iterable, Generator, Literal, TypedDict
+from typing import Any, Iterable, Generator, Literal, TypedDict, Self
 import warnings
 
 from datasets import Dataset, disable_progress_bars, disable_caching
@@ -63,51 +64,45 @@ class Params(TypedDict):
     optimal_params: list[IndexParameters]
 
 
-def parse_args() -> Namespace:
-    parser = ArgumentParser("train.py", "Trains the FAISS index.")
-    subparsers = parser.add_subparsers(dest="mode", required=True)
-
-    clean = subparsers.add_parser("clean")
-    clean.add_argument("-s", "--source", default=None, type=Path)
-
-    train = subparsers.add_parser("train")
-    train.add_argument("source", type=Path)
-    train.add_argument("dest", type=Path)
-    train.add_argument("-d", "--dimensions", default=None, type=int)  # matryoshka
-    train.add_argument("-N", "--normalize", action="store_true")  # also if normalize_d_
-    train.add_argument("-p", "--preprocess", default="OPQ96_384")
-    train.add_argument("-k", "--intersection", default=None, type=int)  # 1R@1 else kR@k
-    train.add_argument("-c", "--clusters", default=None, type=int)
-    train.add_argument("-q", "--queries", default=8192, type=int)
-    train.add_argument("-P", "--progress", action="store_true")
-    train.add_argument("--use-cache", action="store_true")  # for experiments only
-
-    return parser.parse_args()
+@dataclass
+class Args:
+    @classmethod
+    def from_namespace(cls, namespace: Namespace) -> Self:
+        return cls(**vars(namespace))
+    
+    @staticmethod
+    @abstractmethod
+    def add_subparser(subparsers: _SubParsersAction) -> None:
+        ...
 
 
 @dataclass
-class CleanArgs:
+class CleanArgs(Args):
     mode: Literal["clean"]
     source: Path | None
 
-    @classmethod
-    def from_namespace(cls, namespace: Namespace):
-        return cls(**vars(namespace))
+    @staticmethod
+    def add_subparser(subparsers: _SubParsersAction) -> None:
+        clean = subparsers.add_parser("clean")
+        clean.add_argument("-s", "--source", default=None, type=Path)
+
+    def __post_init__(self) -> None:
+        assert self.mode == "clean", f'expected clean mode, got "{self.mode}"'
 
 
 @dataclass
-class TrainArgs:
+class TrainArgs(Args):
     mode: Literal["train"]
     source: Path
     dest: Path
-    dimensions: int | None
-    normalize: bool
+    dimensions: int | None  # matryoshka
+    normalize: bool  # also if normalize_d_
     preprocess: str
-    intersection: int | None
+    intersection: int | None  # 1R@1 else kR@k
     clusters: int | None
     queries: int
     progress: bool
-    use_cache: bool
+    use_cache: bool  # for experiments only
 
     # not args
     ivf_encoding: str = field(init=False, compare=False)
@@ -115,11 +110,23 @@ class TrainArgs:
     one_recall_at_one: bool = field(init=False, compare=False)
     k: int = field(init=False, compare=False)
 
-    @classmethod
-    def from_namespace(cls, namespace: Namespace):
-        return cls(**vars(namespace))
+    @staticmethod
+    def add_subparser(subparsers: _SubParsersAction) -> None:
+        train = subparsers.add_parser("train")
+        train.add_argument("source", type=Path)
+        train.add_argument("dest", type=Path)
+        train.add_argument("-d", "--dimensions", default=None, type=int)
+        train.add_argument("-N", "--normalize", action="store_true")
+        train.add_argument("-p", "--preprocess", default="OPQ96_384")
+        train.add_argument("-k", "--intersection", default=None, type=int)
+        train.add_argument("-c", "--clusters", default=None, type=int)
+        train.add_argument("-q", "--queries", default=8192, type=int)
+        train.add_argument("-P", "--progress", action="store_true")
+        train.add_argument("--use-cache", action="store_true")
 
     def __post_init__(self):
+        assert self.mode == "train", f'expected train mode, got "{self.mode}"'
+
         if not self.source.exists():
             raise ValueError(f'source path "{self.source}" does not exist')
 
@@ -144,6 +151,73 @@ class TrainArgs:
         else:
             self.one_recall_at_one = False
             self.k = self.intersection
+
+
+@dataclass
+class FillArgs(Args):
+    mode: Literal["fill"]
+    source: Path
+    dest: Path
+    progress: bool
+
+    # not args
+    dimensions: int | None = field(init=False, compare=False)
+    normalize: bool = field(init=False, compare=False)
+    use_cache: bool = field(default=False, init=False, compare=False)  # never necessary
+
+    @staticmethod
+    def add_subparser(subparsers: _SubParsersAction) -> None:
+        train = subparsers.add_parser("fill")
+        train.add_argument("source", type=Path)
+        train.add_argument("dest", type=Path)
+        train.add_argument("-P", "--progress", action="store_true")
+
+    # TODO: implement similar properties in TrainArgs
+    @property
+    def trained_path(self) -> Path:
+        return self.dest / "empty.faiss"
+
+    @property
+    def params_path(self) -> Path:
+        return self.dest / "params.json"
+
+    @property
+    def ids_path(self) -> Path:
+        return self.dest / "ids.parquet"
+
+    @property
+    def index_paths(self) -> tuple[Path, Path]:
+        return self.dest / "index.faiss", self.dest / "ondisk.ivfdata"
+
+    def __post_init__(self):
+        assert self.mode == "fill", f'expected fill mode, got "{self.mode}"'
+
+        if not self.source.exists():
+            raise ValueError(f'source path "{self.source}" does not exist')
+
+        if not self.dest.exists():
+            raise ValueError(f'destination path "{self.dest}" does not exist')
+        if not (self.trained_path.exists() and self.params_path.exists()):
+            raise ValueError(
+                f'destination path "{self.dest}" does not point to a trained index'
+            )
+
+        with open(self.params_path) as f:
+            params: Params = json.load(f)
+        
+        self.dimensions = params["dimensions"]
+        self.normalize = params["normalize"]
+
+
+def parse_args() -> Namespace:
+    parser = ArgumentParser("index.py", "Trains or fills the FAISS index.")
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    CleanArgs.add_subparser(subparsers)
+    TrainArgs.add_subparser(subparsers)
+    FillArgs.add_subparser(subparsers)
+
+    return parser.parse_args()
 
 
 @contextmanager
@@ -386,7 +460,7 @@ def make_index(
     dataset: Dataset,
     holdouts: torch.Tensor | None,
     cache_dir: Path,
-    args: TrainArgs,
+    args: TrainArgs | FillArgs,
 ) -> None:
     holdout_list = [] if holdouts is None else holdouts.tolist()
     cache_identifier = hash([trained_path, dataset._fingerprint, *holdout_list])
@@ -571,11 +645,12 @@ def clean_cache(args: CleanArgs, cache_dir: Path):
                 lock.unlink()
 
 
-def ensure_trained(dataset: Dataset, args: TrainArgs) -> tuple[Path, Path]:
+def ensure_trained(dataset: Dataset, args: TrainArgs):
+    # TODO: replace skip with a warning to CTRL+C about index instability and a sleep
     trained_dest_path = args.dest / "empty.faiss"
     params_path = args.dest / "params.json"
     if trained_dest_path.exists() and params_path.exists():
-        return trained_dest_path, params_path
+        return
 
     # extract a "train" set and a "test" set, which is actually ground-truth
     # queries to be held out from the making of a provisional index
@@ -611,41 +686,39 @@ def ensure_trained(dataset: Dataset, args: TrainArgs) -> tuple[Path, Path]:
                 args.normalize,
                 optimal_params
             )
-    
-    return trained_dest_path, params_path
 
 
-def ensure_filled(
-    dataset: Dataset, trained_path: Path, args: TrainArgs
-) -> tuple[Path, Path, Path]:
+def ensure_filled(dataset: Dataset, args: FillArgs) -> None:
     # TODO: make make_index take index_paths entries?
-    ids_path = args.dest / "ids.parquet"
-    index_paths = (args.dest / "index.faiss", args.dest / "ondisk.ivfdata")
-    with del_on_exc([ids_path, *index_paths]):
-        save_ids(ids_path, dataset)
-        make_index(args.dest, trained_path, dataset, None, CACHE, args)
-    return ids_path, *index_paths
+    with del_on_exc([args.ids_path, *args.index_paths]):
+        save_ids(args.ids_path, dataset)
+        make_index(args.dest, args.trained_path, dataset, None, CACHE, args)
 
 
 def main():
     args = parse_args()
 
-    if args.mode == "clean":
-        args = CleanArgs.from_namespace(args)
-        clean_cache(args, CACHE)
-        return 0
-
-    CACHE.mkdir(exist_ok=True)
-
     try:
-        args = TrainArgs.from_namespace(args)
+        if args.mode == "clean":
+            args = CleanArgs.from_namespace(args)
+        elif args.mode == "train":
+            args = TrainArgs.from_namespace(args)
+        else:  # args.mode == "fill"
+            args = FillArgs.from_namespace(args)
     except ValueError as e:
         print("error:", e.args[0], file=stderr)
         return 1
 
-    # run through global huggingface datasets settings
+    if args.mode == "clean":
+        clean_cache(args, CACHE)
+        return 0
+
     if not args.use_cache:
+        # run through global huggingface datasets settings
         disable_caching()
+    else:
+        CACHE.mkdir(exist_ok=True)
+
     if not args.progress:
         disable_progress_bars()
 
@@ -654,8 +727,10 @@ def main():
     if not args.dest.exists():
         args.dest.mkdir()
 
-    trained_path, _ = ensure_trained(dataset, args)
-    _ = ensure_filled(dataset, trained_path, args)
+    if args.mode == "train":
+        ensure_trained(dataset, args)
+    else:  # args.mode == "fill"
+        ensure_filled(dataset, args)
 
 
 if __name__ == "__main__":
