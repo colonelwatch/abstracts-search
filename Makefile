@@ -38,24 +38,25 @@ data.sqlite:
 events:
 	mkdir events
 
-# warn if the we're within a day after manifest update or 20 days out, then allow the
-# user to ctrl+C within a short amount of time? Can I get the manifest time form
-# HTTP headers, or will I need to bring in the pull parse pattern after all?
-FORCE:
-remote_targets.mk manifest.txt &: FORCE
-	tmp=$$(mktemp); 							\
-	curl -s "https://openalex.s3.amazonaws.com/data/works/manifest" | 	\
-		jq -r .entries[].url | sort > "$$tmp"; 				\
-	if ! cmp -s "$$tmp" manifest.txt; then 					\
-		mv "$$tmp" manifest.txt;					\
-	fi
-
+remote_targets.mk: manifest.txt
 	tmp=$$(mktemp); 						\
 	echo "events = \\" > "$$tmp" && sed -E 				\
 		-e 's|.*/works/(.*)/part_[0-9]+.gz|events/\1 \\|' 	\
 		-e 's/=/$$(EQ)/' manifest.txt | uniq >> "$$tmp"; 	\
 	if ! cmp -s "$$tmp" remote_targets.mk; then 			\
 		mv "$$tmp" remote_targets.mk; 				\
+	fi
+
+# warn if the we're within a day after manifest update or 20 days out, then allow the
+# user to ctrl+C within a short amount of time? Can I get the manifest time form
+# HTTP headers, or will I need to bring in the pull parse pattern after all?
+FORCE:
+manifest.txt: FORCE
+	tmp=$$(mktemp); 							\
+	curl -s "https://openalex.s3.amazonaws.com/data/works/manifest" | 	\
+		jq -r .entries[].url | sort > "$$tmp"; 				\
+	if ! cmp -s "$$tmp" manifest.txt; then 					\
+		mv "$$tmp" manifest.txt;					\
 	fi
 
 .PHONY: recover
