@@ -14,7 +14,7 @@ class VectorConverter:
         self.to_dtype = to_dtype
 
     def from_sql_binary(self, val: bytes) -> npt.NDArray:
-        if self.bf16:   # do bf16 -> fp32/16 (TODO: do this with pure numpy code?)
+        if self.bf16:  # do bf16 -> fp32/16 (TODO: do this with pure numpy code?)
             arr = np.frombuffer(val, dtype=np.uint16)
             t = torch.tensor(arr.copy())  # PyTorch complains about read-only memory
             arr = t.view(torch.bfloat16)
@@ -34,9 +34,7 @@ def to_sql_binary(vect: torch.Tensor) -> sqlite3.Binary:
 
 
 def create_embeddings_table(conn: sqlite3.Connection, bf16: bool):
-    conn.execute(
-        "CREATE TABLE embeddings(id TEXT PRIMARY KEY, embedding vector)"
-    )
+    conn.execute("CREATE TABLE embeddings(id TEXT PRIMARY KEY, embedding vector)")
     conn.execute("CREATE TABLE properties(key TEXT, value TEXT)")
     conn.execute(
         "INSERT INTO properties VALUES(?, ?)", ("dtype", "bf16" if bf16 else "fp16")
@@ -49,7 +47,7 @@ def insert_embeddings(
     conn.executemany(
         "INSERT INTO embeddings VALUES(?, ?) "
         "ON CONFLICT(id) DO UPDATE SET embedding=excluded.embedding",
-        zip(oa_ids, embeddings)
+        zip(oa_ids, embeddings),
     )
 
 

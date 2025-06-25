@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sqlite3
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from shutil import rmtree
-import sqlite3
 from sys import stderr
 from typing import Generator, Literal
 
@@ -30,7 +30,10 @@ import torch
 
 from utils.env_utils import BF16
 from utils.table_utils import (
-    create_embeddings_table, insert_embeddings, to_sql_binary, VectorConverter
+    VectorConverter,
+    create_embeddings_table,
+    insert_embeddings,
+    to_sql_binary,
 )
 
 
@@ -58,8 +61,7 @@ def to_arrays(
 
 
 def to_chunks(
-    dataset: sqlite3.Cursor,
-    size: int
+    dataset: sqlite3.Cursor, size: int
 ) -> Generator[tuple[pa.Array, pa.Array], None, None]:
     ids_batch: list[str] = []
     embeddings_batch: list[npt.NDArray] = []
@@ -86,7 +88,7 @@ def open_parquet(path: str | Path, dim: int, bf16: bool) -> pq.ParquetWriter:
             str(path),
             pa.schema(schema),
             compression="lz4",
-            use_byte_stream_split=["embedding"]  # type: ignore (documented option)
+            use_byte_stream_split=["embedding"],  # type: ignore (documented option)
         )
     else:
         # otherwise, compressing float embeddings isn't worth it

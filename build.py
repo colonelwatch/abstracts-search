@@ -14,24 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import queue
+import sqlite3
+import sys
 from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-import json
-import queue
 from pathlib import Path
-import sys
-from subprocess import Popen, PIPE
-import sqlite3
-from threading import Thread, Event
-from typing import cast, TextIO, Iterable, Generator, Self
+from subprocess import PIPE, Popen
+from threading import Event, Thread
+from typing import Generator, Iterable, Self, TextIO, cast
 
+import torch
 from filelock import FileLock
 from sentence_transformers import SentenceTransformer
-import torch
 from tqdm import tqdm
 
-from utils.env_utils import MODEL, TRUST_REMOTE_CODE, BF16
+from utils.env_utils import BF16, MODEL, TRUST_REMOTE_CODE
 from utils.gpu_utils import imap, iunsqueeze, iunzip
 from utils.table_utils import insert_embeddings, to_sql_binary
 
@@ -56,11 +56,11 @@ def get_model(
     # start queries in parallel
     p1 = Popen(
         ["nvidia-smi", "--query-gpu=gpu_bus_id,index", "--format=csv,noheader"],
-        stdout=PIPE
+        stdout=PIPE,
     )
     p2 = Popen(
         ["nvidia-smi", "--query-compute-apps=gpu_bus_id,name", "--format=csv,noheader"],
-        stdout=PIPE
+        stdout=PIPE,
     )
     assert p1.stdout is not None
     assert p2.stdout is not None
@@ -86,7 +86,7 @@ def get_model(
         model_name,
         device=f"cuda:{selected_index}",
         trust_remote_code=trust_remote_code,
-        model_kwargs={"torch_dtype": torch.bfloat16 if bf16 else torch.float16}
+        model_kwargs={"torch_dtype": torch.bfloat16 if bf16 else torch.float16},
     )
 
     return model
@@ -122,7 +122,7 @@ class OaJsonlBatched:
 
     def _load_routine(self):
         stdin_cast = cast(TextIO, sys.stdin)
-        
+
         ids_batch: list[str] = []
         documents_batch: list[str] = []
         for line in stdin_cast.buffer:
@@ -188,6 +188,7 @@ class SharedConnection:
             conn = self._ensure_conn()
             insert_embeddings(oa_ids, embeddings, conn)
             conn.commit()
+
         _ = self._worker.submit(_insert)
 
     def _ensure_conn(self) -> sqlite3.Connection:
@@ -222,6 +223,7 @@ def filter_batched(
             yield ids_out, documents_out
 
     with tqdm(disable=(not progress)) as count:
+
         def filt(ids: list[str], documents: list[str]):
             batch = {id_: document for id_, document in zip(ids, documents)}
             for id_ in conn.pick_existing(ids):
@@ -285,7 +287,7 @@ def main():
     sqlite3.register_adapter(torch.Tensor, to_sql_binary)
     with (
         OaJsonlBatched(args.filter_batch_size) as batches,
-        SharedConnection(args.data_path) as conn
+        SharedConnection(args.data_path) as conn,
     ):
         batches = filter_batched(
             batches, conn, args.batch_size, args.filter_tasks, args.progress

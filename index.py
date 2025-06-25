@@ -14,29 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import logging
+import re
+import warnings
 from abc import abstractmethod
 from argparse import ArgumentParser, Namespace, _SubParsersAction
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
-import json
-import logging
-import re
 from pathlib import Path
-from shutil import rmtree, copy
+from shutil import copy, rmtree
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Iterable, Generator, Literal, TypedDict, Self
-import warnings
+from typing import Any, Generator, Iterable, Literal, Self, TypedDict
 
-from datasets import Dataset, disable_progress_bars, disable_caching
-from datasets.config import HF_DATASETS_CACHE
-from datasets.fingerprint import Hasher
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
-from faiss.contrib.ondisk import merge_ondisk
 import numpy as np
 import numpy.typing as npt
 import torch
+from datasets import Dataset, disable_caching, disable_progress_bars
+from datasets.config import HF_DATASETS_CACHE
+from datasets.fingerprint import Hasher
+from faiss.contrib.ondisk import merge_ondisk
 from tqdm import tqdm
 
 from utils.env_utils import CACHE
@@ -69,11 +69,10 @@ class Args:
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
         return cls(**vars(namespace))
-    
+
     @staticmethod
     @abstractmethod
-    def add_subparser(subparsers: _SubParsersAction) -> None:
-        ...
+    def add_subparser(subparsers: _SubParsersAction) -> None: ...
 
 
 @dataclass
@@ -134,12 +133,12 @@ class TrainArgs(Args):
             self.normalize = True
             warnings.warn("inferring --normalize from --dimension")
 
-        if (match := OPQ_PATTERN.match(self.preprocess)):
+        if match := OPQ_PATTERN.match(self.preprocess):
             self.ivf_encoding = f"PQ{match[1]}"
             self.encoding_width = int(match[1])
             if self.encoding_width not in GPU_OPQ_WIDTHS:
                 raise ValueError(f"OPQ width {self.encoding_width} is not valid")
-        elif (match := RR_PATTERN.match(self.preprocess)):
+        elif match := RR_PATTERN.match(self.preprocess):
             self.ivf_encoding = "SQ8"
             self.encoding_width = int(match[1])
         else:
@@ -204,7 +203,7 @@ class FillArgs(Args):
 
         with open(self.params_path) as f:
             params: Params = json.load(f)
-        
+
         self.dimensions = params["dimensions"]
         self.normalize = params["normalize"]
 
@@ -251,7 +250,7 @@ def hash(parameters: list) -> str:
 
 
 def iter_tensors(
-    dataset: Dataset
+    dataset: Dataset,
 ) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
     with dataset.formatted_as("torch", columns=["index", "embedding"]):
         for batch in dataset.iter(BATCH_SIZE):
@@ -310,7 +309,7 @@ def make_ground_truth(
             scores = torch.cdist(
                 q_embeddings_copy[device.index],
                 embeddings,
-                compute_mode="donot_use_mm_for_euclid_dist"
+                compute_mode="donot_use_mm_for_euclid_dist",
             )
 
         # only yield k from this batch, in the extreme this k replaces all running k
@@ -391,7 +390,7 @@ def create_memmap(
 
     def preproc(_, embeddings: torch.Tensor) -> torch.Tensor:
         if args.dimensions is not None:
-            embeddings = embeddings[:, :args.dimensions]
+            embeddings = embeddings[:, : args.dimensions]
         if args.normalize:
             embeddings = torch.nn.functional.normalize(embeddings)
         return embeddings
@@ -402,14 +401,14 @@ def create_memmap(
         del_on_exc(cache_path),
         tqdm(
             desc="create_memmap", total=len(dataset), disable=(not args.progress)
-        ) as counter
+        ) as counter,
     ):
         batches = iter_tensors(dataset)
         batches = imap(batches, preproc, -1)
         for embeddings_batch in batches:
             # save batches to disk by assigning to memmap slices
             n_batch = len(embeddings_batch)
-            memmap[i:(i + n_batch)] = embeddings_batch.numpy()
+            memmap[i : (i + n_batch)] = embeddings_batch.numpy()
             i += n_batch
             counter.update(n_batch)
 
@@ -487,7 +486,7 @@ def make_index(
             ids = ids[not_in]
             embeddings = embeddings[not_in]
         if args.dimensions is not None:
-            embeddings = embeddings[:, :args.dimensions]
+            embeddings = embeddings[:, : args.dimensions]
         if args.normalize:
             embeddings = torch.nn.functional.normalize(embeddings)
         return ids, embeddings
@@ -559,7 +558,7 @@ def tune_index(
         gt_ids: npt.NDArray[np.int32] = ground_truth["gt_ids"]  # type: ignore
 
     if args.dimensions is not None:
-        q = q[:, :args.dimensions]
+        q = q[:, : args.dimensions]
     if args.normalize:
         q = q / np.linalg.norm(q, ord=2, axis=1)[:, np.newaxis]
     gt_ids_int64 = gt_ids.astype(np.int64)  # faiss expects int64
@@ -600,7 +599,7 @@ def save_params(
     path: Path,
     dimensions: int | None,
     normalize: bool,
-    optimal_params: list[IndexParameters]
+    optimal_params: list[IndexParameters],
 ):
     params = Params(
         dimensions=dimensions, normalize=normalize, optimal_params=optimal_params
@@ -626,10 +625,7 @@ def clean_cache(args: CleanArgs, cache_dir: Path):
         file_0_path_rel = file_0_path.relative_to(HF_DATASETS_CACHE)
         dataset_name = file_0_path_rel.parts[0]
         cache_name = file_0_path_rel.parts[1]
-        if not (
-            dataset_name == "parquet"
-            and "default-" in cache_name
-        ):
+        if not (dataset_name == "parquet" and "default-" in cache_name):
             print("error: path integrity check failed", file=stderr)
             return 1
 
@@ -680,12 +676,7 @@ def ensure_trained(dataset: Dataset, args: TrainArgs):
 
         with del_on_exc([trained_dest_path, params_path]):
             copy(trained_path, trained_dest_path)
-            save_params(
-                params_path,
-                args.dimensions,
-                args.normalize,
-                optimal_params
-            )
+            save_params(params_path, args.dimensions, args.normalize, optimal_params)
 
 
 def ensure_filled(dataset: Dataset, args: FillArgs) -> None:
