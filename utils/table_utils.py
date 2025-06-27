@@ -41,6 +41,21 @@ def create_embeddings_table(conn: sqlite3.Connection, bf16: bool):
     )
 
 
+def query_bf16(conn: sqlite3.Connection) -> bool:
+    (dtype,) = conn.execute(
+        "SELECT value FROM properties where key = 'dtype'"
+    ).fetchone()
+
+    if dtype == "bf16":
+        bf16 = True
+    elif dtype == "fp16":
+        bf16 = False
+    else:
+        raise ValueError("database contains an invalid dtype value")
+
+    return bf16
+
+
 def insert_embeddings(
     oa_ids: Iterable[str], embeddings: Iterable[torch.Tensor], conn: sqlite3.Connection
 ):

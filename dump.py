@@ -33,6 +33,7 @@ from utils.table_utils import (
     VectorConverter,
     create_embeddings_table,
     insert_embeddings,
+    query_bf16,
     to_sql_binary,
 )
 
@@ -116,15 +117,7 @@ def dump_database(
 
     # detect the type used in the database
     with sqlite3.connect(source, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-        (dtype,) = conn.execute(
-            "SELECT value FROM properties where key = 'dtype'"
-        ).fetchone()
-        if dtype == "bf16":
-            bf16 = True
-        elif dtype == "fp16":
-            bf16 = False
-        else:
-            raise ValueError("database contains an invalid dtype value")
+        bf16 = query_bf16(conn)
 
     # VectorConverter does torch.bfloat16 to np.float32
     to_dtype = "fp32" if enforce == "bf16" else enforce
