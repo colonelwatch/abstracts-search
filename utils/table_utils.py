@@ -14,16 +14,19 @@ class VectorConverter:
         self.to_dtype = to_dtype
 
     def from_sql_binary(self, val: bytes) -> npt.NDArray:
-        if self.bf16:  # do bf16 -> fp32/16 (TODO: do this with pure numpy code?)
-            arr = np.frombuffer(val, dtype=np.uint16)
-            t = torch.tensor(arr.copy())  # PyTorch complains about read-only memory
-            arr = t.view(torch.bfloat16)
-            arr = t.half() if self.to_dtype == "fp16" else t.float()
-            arr = t.numpy()
+        if self.bf16:
+            arr = np.frombuffer(val, dtype=np.uint16).copy()
+            t = torch.tensor(arr).view(torch.bfloat16)
+            arr = t.to(torch.float32).numpy()
         else:
             arr = np.frombuffer(val, dtype=np.float16)
-            if self.to_dtype == "fp32":
-                arr = arr.astype(np.float32)
+
+        if self.to_dtype == "fp32":
+            arr = arr.astype(np.float32)
+        elif self.to_dtype == "fp16":
+            arr = arr.astype(np.float16)
+        # else don't coerce from the original dtype
+
         return arr
 
 
