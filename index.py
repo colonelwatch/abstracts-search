@@ -19,7 +19,7 @@ import logging
 import re
 import warnings
 from abc import abstractmethod
-from argparse import ArgumentParser, Namespace, _SubParsersAction
+from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import accumulate, tee
@@ -72,7 +72,7 @@ class Args:
 
     @staticmethod
     @abstractmethod
-    def add_subparser(subparsers: _SubParsersAction) -> None: ...
+    def configure_parser(parser: ArgumentParser) -> None: ...
 
 
 @dataclass
@@ -81,9 +81,8 @@ class CleanArgs(Args):
     source: Path | None
 
     @staticmethod
-    def add_subparser(subparsers: _SubParsersAction) -> None:
-        clean = subparsers.add_parser("clean")
-        clean.add_argument("-s", "--source", default=None, type=Path)
+    def configure_parser(parser: ArgumentParser) -> None:
+        parser.add_argument("-s", "--source", default=None, type=Path)
 
     def __post_init__(self) -> None:
         assert self.mode == "clean", f'expected clean mode, got "{self.mode}"'
@@ -110,18 +109,17 @@ class TrainArgs(Args):
     k: int = field(init=False, compare=False)
 
     @staticmethod
-    def add_subparser(subparsers: _SubParsersAction) -> None:
-        train = subparsers.add_parser("train")
-        train.add_argument("source", type=Path)
-        train.add_argument("dest", type=Path)
-        train.add_argument("-d", "--dimensions", default=None, type=int)
-        train.add_argument("-N", "--normalize", action="store_true")
-        train.add_argument("-p", "--preprocess", default="OPQ96_384")
-        train.add_argument("-k", "--intersection", default=None, type=int)
-        train.add_argument("-c", "--clusters", default=None, type=int)
-        train.add_argument("-q", "--queries", default=8192, type=int)
-        train.add_argument("-P", "--progress", action="store_true")
-        train.add_argument("--use-cache", action="store_true")
+    def configure_parser(parser: ArgumentParser) -> None:
+        parser.add_argument("source", type=Path)
+        parser.add_argument("dest", type=Path)
+        parser.add_argument("-d", "--dimensions", default=None, type=int)
+        parser.add_argument("-N", "--normalize", action="store_true")
+        parser.add_argument("-p", "--preprocess", default="OPQ96_384")
+        parser.add_argument("-k", "--intersection", default=None, type=int)
+        parser.add_argument("-c", "--clusters", default=None, type=int)
+        parser.add_argument("-q", "--queries", default=8192, type=int)
+        parser.add_argument("-P", "--progress", action="store_true")
+        parser.add_argument("--use-cache", action="store_true")
 
     def __post_init__(self):
         assert self.mode == "train", f'expected train mode, got "{self.mode}"'
@@ -165,11 +163,10 @@ class FillArgs(Args):
     use_cache: bool = field(default=False, init=False, compare=False)  # never necessary
 
     @staticmethod
-    def add_subparser(subparsers: _SubParsersAction) -> None:
-        train = subparsers.add_parser("fill")
-        train.add_argument("source", type=Path)
-        train.add_argument("dest", type=Path)
-        train.add_argument("-P", "--progress", action="store_true")
+    def configure_parser(parser: ArgumentParser) -> None:
+        parser.add_argument("source", type=Path)
+        parser.add_argument("dest", type=Path)
+        parser.add_argument("-P", "--progress", action="store_true")
 
     # TODO: implement similar properties in TrainArgs
     @property
@@ -211,11 +208,9 @@ class FillArgs(Args):
 def parse_args() -> Namespace:
     parser = ArgumentParser("index.py", "Trains or fills the FAISS index.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-
-    CleanArgs.add_subparser(subparsers)
-    TrainArgs.add_subparser(subparsers)
-    FillArgs.add_subparser(subparsers)
-
+    CleanArgs.configure_parser(subparsers.add_parser("clean"))
+    TrainArgs.configure_parser(subparsers.add_parser("train"))
+    FillArgs.configure_parser(subparsers.add_parser("fill"))
     return parser.parse_args()
 
 
