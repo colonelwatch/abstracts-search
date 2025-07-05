@@ -13,7 +13,7 @@ INDEXTRAINFLAGS ?=
 INDEXFILLFLAGS ?=
 
 # TODO: deal with this excessively complicated rule
-$(INDEX_DIR)/ids.parquet $(INDEX_DIR)/index.faiss $(INDEX_DIR)/ondisk.ivfdata &: $(DATA_DIR) | $(INDEX_DIR)/empty.faiss $(INDEX_DIR)/empty.faiss
+$(INDEX_DIR)/ids.parquet $(INDEX_DIR)/index.faiss $(INDEX_DIR)/ondisk.ivfdata &: $(DATA_DIR) | $(INDEX_DIR)/empty.faiss
 	$(PYTHON) ./index.py fill $(INDEXFILLFLAGS) $< $(INDEX_DIR)
 
 $(INDEX_DIR)/empty.faiss $(INDEX_DIR)/params.json &: $(DATA_DIR)
