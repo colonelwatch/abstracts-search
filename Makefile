@@ -7,22 +7,26 @@ SHELL := bash
 PYTHON := conda run -n abstracts-search --live-stream python
 
 CFLAGS ?= -O2
-BUILDFLAGS ?=
-DUMPFLAGS ?=
-INDEXTRAINFLAGS ?=
-INDEXFILLFLAGS ?=
+INDEXFLAGS += -B $(INDEX_DIR)
 
-# TODO: deal with this excessively complicated rule
-$(INDEX_DIR)/ids.parquet $(INDEX_DIR)/index.faiss $(INDEX_DIR)/ondisk.ivfdata &: $(DATA_DIR) | $(INDEX_DIR)/empty.faiss
-	$(PYTHON) ./index.py fill $(INDEXFILLFLAGS) $< $(INDEX_DIR)
+.PHONY: all
+INDEX_FILL_TARGETS := $(addprefix $(INDEX_DIR)/, ids.parquet index.faiss ondisk.ivfdata)
+INDEX_TRAIN_TARGETS := $(addprefix $(INDEX_DIR)/, empty.faiss untuned.json)
+all: $(INDEX_FILL_TARGETS) $(INDEX_DIR)/params.json
 
-$(INDEX_DIR)/empty.faiss $(INDEX_DIR)/params.json &: $(DATA_DIR)
-	$(PYTHON) ./index.py train $(INDEXTRAINFLAGS) $< $(INDEX_DIR)
+$(INDEX_FILL_TARGETS) &: $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
+	$(PYTHON) index.py $(INDEXFLAGS) fill $(INDEXFILLFLAGS) $(DATA_DIR)
+
+$(INDEX_DIR)/params.json: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
+	$(PYTHON) index.py $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
+
+$(INDEX_TRAIN_TARGETS) &: | $(DATA_DIR)
+	$(PYTHON) index.py $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
 
 include remote_targets.mk
 EQ := =
 $(DATA_DIR) abstracts-embeddings/events &: | $(events)
-	$(PYTHON) ./dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
+	$(PYTHON) dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
 
 # in theory, wouldn't I need to handle two objects in one line here? I could probably
@@ -34,7 +38,7 @@ events/updated_date$(EQ)% : | manifest.txt oa_jsonl data.sqlite events
 	grep "$(subst events/,,$@)" manifest.txt | 			\
 		sed "s|$$s3_base|$$http_base|" | xargs -- curl -s | 	\
 		gunzip | ./oa_jsonl | 					\
-		$(PYTHON) ./build.py $(BUILDFLAGS) data.sqlite
+		$(PYTHON) build.py $(BUILDFLAGS) data.sqlite
 	touch $@
 
 oa_jsonl: oa_jsonl.c
@@ -69,7 +73,7 @@ manifest.txt: FORCE
 
 .PHONY: recover
 recover:
-	$(PYTHON) ./dump.py $(DUMPFLAGS) $(DATA_DIR) data.sqlite
+	$(PYTHON) dump.py $(DUMPFLAGS) $(DATA_DIR) data.sqlite
 	cp -r abstracts-embeddings/events ./
 
 .PHONY: clean

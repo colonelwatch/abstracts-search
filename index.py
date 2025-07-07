@@ -18,7 +18,6 @@ import json
 import logging
 import re
 import warnings
-from abc import abstractmethod
 from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -61,18 +60,50 @@ class IndexParameters(TypedDict):
 class Params(TypedDict):
     dimensions: int | None
     normalize: bool
-    optimal_params: list[IndexParameters]
+    optimal_params: list[IndexParameters] | None
 
 
 @dataclass
 class Args:
+    build_dir: Path
+    progress: bool
+    use_cache: bool  # for experiments only
+
+    def __post_init__(self) -> None:
+        if self.build_dir.exists() and not self.build_dir.is_dir():
+            raise ValueError(
+                f'build dir "{self.build_dir}" exists but is not a directory'
+            )
+
     @classmethod
     def from_namespace(cls, namespace: Namespace) -> Self:
         return cls(**vars(namespace))
 
     @staticmethod
-    @abstractmethod
-    def configure_parser(parser: ArgumentParser) -> None: ...
+    def configure_parser(parser: ArgumentParser) -> None:
+        parser.add_argument("-B", "--build-dir", default=Path("."), type=Path)
+        parser.add_argument("-P", "--progress", action="store_true")
+        parser.add_argument("--use-cache", action="store_true")
+
+    @property
+    def empty_index_path(self) -> Path:
+        return self.build_dir / "empty.faiss"
+
+    @property
+    def untuned_params_path(self) -> Path:
+        return self.build_dir / "untuned.json"
+
+    @property
+    def params_path(self) -> Path:
+        return self.build_dir / "params.json"
+
+    @property
+    def ids_path(self) -> Path:
+        return self.build_dir / "ids.parquet"
+
+    @property
+    def index_paths(self) -> tuple[Path, Path]:
+        return self.build_dir / "index.faiss", self.build_dir / "ondisk.ivfdata"
 
 
 @dataclass
@@ -85,6 +116,7 @@ class CleanArgs(Args):
         parser.add_argument("-s", "--source", default=None, type=Path)
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         assert self.mode == "clean", f'expected clean mode, got "{self.mode}"'
 
 
@@ -92,36 +124,25 @@ class CleanArgs(Args):
 class TrainArgs(Args):
     mode: Literal["train"]
     source: Path
-    dest: Path
     dimensions: int | None  # matryoshka
     normalize: bool  # also if normalize_d_
     preprocess: str
-    intersection: int | None  # 1R@1 else kR@k
     clusters: int | None
-    queries: int
-    progress: bool
-    use_cache: bool  # for experiments only
 
     # not args
     ivf_encoding: str = field(init=False, compare=False)
     encoding_width: int = field(init=False, compare=False)
-    one_recall_at_one: bool = field(init=False, compare=False)
-    k: int = field(init=False, compare=False)
 
     @staticmethod
     def configure_parser(parser: ArgumentParser) -> None:
         parser.add_argument("source", type=Path)
-        parser.add_argument("dest", type=Path)
         parser.add_argument("-d", "--dimensions", default=None, type=int)
         parser.add_argument("-N", "--normalize", action="store_true")
         parser.add_argument("-p", "--preprocess", default="OPQ96_384")
-        parser.add_argument("-k", "--intersection", default=None, type=int)
         parser.add_argument("-c", "--clusters", default=None, type=int)
-        parser.add_argument("-q", "--queries", default=8192, type=int)
-        parser.add_argument("-P", "--progress", action="store_true")
-        parser.add_argument("--use-cache", action="store_true")
 
     def __post_init__(self):
+        super().__post_init__()
         assert self.mode == "train", f'expected train mode, got "{self.mode}"'
 
         if not self.source.exists():
@@ -142,6 +163,39 @@ class TrainArgs(Args):
         else:
             raise ValueError(f'preprocessing string "{self.preprocess}" is not valid')
 
+
+@dataclass
+class TuneArgs(Args):
+    mode: Literal["tune"]
+    source: Path
+    intersection: int | None  # 1R@1 else kR@k
+    queries: int
+
+    # not args
+    one_recall_at_one: bool = field(init=False, compare=False)
+    k: int = field(init=False, compare=False)
+    dimensions: int | None = field(init=False, compare=False)
+    normalize: bool = field(init=False, compare=False)
+
+    @staticmethod
+    def configure_parser(parser: ArgumentParser) -> None:
+        parser.add_argument("source", type=Path)
+        parser.add_argument("-k", "--intersection", default=None, type=int)
+        parser.add_argument("-q", "--queries", action="store_true")
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.mode == "tune", f'expected tune mode, got "{self.mode}"'
+
+        if not self.source.exists():
+            raise ValueError(f'source path "{self.source}" does not exist')
+        if not self.empty_index_path.exists():
+            raise ValueError(f'empty index "{self.empty_index_path}" does not exist')
+        if not self.untuned_params_path.exists():
+            raise ValueError(
+                f'untuned params "{self.untuned_params_path}" does not exist'
+            )
+
         if self.intersection is None:
             self.one_recall_at_one = True
             self.k = 1
@@ -149,67 +203,51 @@ class TrainArgs(Args):
             self.one_recall_at_one = False
             self.k = self.intersection
 
+        with open(self.untuned_params_path) as f:
+            params: Params = json.load(f)
+        self.dimensions = params["dimensions"]
+        self.normalize = params["normalize"]
+
 
 @dataclass
 class FillArgs(Args):
     mode: Literal["fill"]
     source: Path
-    dest: Path
-    progress: bool
 
     # not args
     dimensions: int | None = field(init=False, compare=False)
     normalize: bool = field(init=False, compare=False)
-    use_cache: bool = field(default=False, init=False, compare=False)  # never necessary
 
     @staticmethod
     def configure_parser(parser: ArgumentParser) -> None:
         parser.add_argument("source", type=Path)
-        parser.add_argument("dest", type=Path)
-        parser.add_argument("-P", "--progress", action="store_true")
-
-    # TODO: implement similar properties in TrainArgs
-    @property
-    def trained_path(self) -> Path:
-        return self.dest / "empty.faiss"
-
-    @property
-    def params_path(self) -> Path:
-        return self.dest / "params.json"
-
-    @property
-    def ids_path(self) -> Path:
-        return self.dest / "ids.parquet"
-
-    @property
-    def index_paths(self) -> tuple[Path, Path]:
-        return self.dest / "index.faiss", self.dest / "ondisk.ivfdata"
 
     def __post_init__(self):
+        super().__post_init__()
         assert self.mode == "fill", f'expected fill mode, got "{self.mode}"'
 
         if not self.source.exists():
             raise ValueError(f'source path "{self.source}" does not exist')
-
-        if not self.dest.exists():
-            raise ValueError(f'destination path "{self.dest}" does not exist')
-        if not (self.trained_path.exists() and self.params_path.exists()):
+        if not self.empty_index_path.exists():
+            raise ValueError(f'empty index "{self.empty_index_path}" does not exist')
+        if not self.untuned_params_path.exists():
             raise ValueError(
-                f'destination path "{self.dest}" does not point to a trained index'
+                f'untuned params "{self.untuned_params_path}" does not exist'
             )
 
-        with open(self.params_path) as f:
+        with open(self.untuned_params_path) as f:
             params: Params = json.load(f)
-
         self.dimensions = params["dimensions"]
         self.normalize = params["normalize"]
 
 
 def parse_args() -> Namespace:
     parser = ArgumentParser("index.py", "Trains or fills the FAISS index.")
+    Args.configure_parser(parser)
     subparsers = parser.add_subparsers(dest="mode", required=True)
     CleanArgs.configure_parser(subparsers.add_parser("clean"))
     TrainArgs.configure_parser(subparsers.add_parser("train"))
+    TuneArgs.configure_parser(subparsers.add_parser("tune"))
     FillArgs.configure_parser(subparsers.add_parser("fill"))
     return parser.parse_args()
 
@@ -254,7 +292,7 @@ def iter_tensors(
 
 # NOTE: ground truth is computed with the full embedding length
 def make_ground_truth(
-    dataset: Dataset, queries: Dataset, cache_dir: Path, args: TrainArgs
+    dataset: Dataset, queries: Dataset, cache_dir: Path, args: TuneArgs
 ) -> Dataset:
     cache_identifier = hash(
         [dataset._fingerprint, queries._fingerprint, args.normalize, args.k]
@@ -450,14 +488,14 @@ def train_index(
 
 def make_index(
     dir: Path,
-    trained_path: Path,
+    empty_index_path: Path,
     dataset: Dataset,
     holdouts: torch.Tensor | None,
     cache_dir: Path,
-    args: TrainArgs | FillArgs,
+    args: TuneArgs | FillArgs,
 ) -> None:
     holdout_list = [] if holdouts is None else holdouts.tolist()
-    cache_identifier = hash([trained_path, dataset._fingerprint, *holdout_list])
+    cache_identifier = hash([empty_index_path, dataset._fingerprint, *holdout_list])
 
     index_cache_path = cache_dir / f"filled_{cache_identifier}.faiss"
     ondisk_cache_path = cache_dir / f"ondisk_{cache_identifier}.ivfdata"
@@ -467,7 +505,7 @@ def make_index(
         return
 
     # clone trained index for filling on the GPU and merging on the CPU
-    trained_index = faiss.read_index(str(trained_path))
+    trained_index = faiss.read_index(str(empty_index_path))
     on_gpus: list[faiss.Index] = [
         to_gpu(trained_index) for _ in range(torch.cuda.device_count())
     ]
@@ -546,7 +584,7 @@ def open_ondisk(dir: Path) -> faiss.Index:
 
 
 def tune_index(
-    filled_index: faiss.Index, ground_truth: Dataset, args: TrainArgs
+    filled_index: faiss.Index, ground_truth: Dataset, args: TuneArgs
 ) -> list[IndexParameters]:
     with ground_truth.formatted_as("numpy"):
         q: npt.NDArray[np.float32] = ground_truth["embedding"]  # type: ignore
@@ -594,7 +632,7 @@ def save_params(
     path: Path,
     dimensions: int | None,
     normalize: bool,
-    optimal_params: list[IndexParameters],
+    optimal_params: list[IndexParameters] | None,
 ):
     params = Params(
         dimensions=dimensions, normalize=normalize, optimal_params=optimal_params
@@ -637,48 +675,54 @@ def clean_cache(args: CleanArgs, cache_dir: Path):
 
 
 def ensure_trained(dataset: Dataset, args: TrainArgs):
-    # TODO: replace skip with a warning to CTRL+C about index instability and a sleep
-    trained_dest_path = args.dest / "empty.faiss"
-    params_path = args.dest / "params.json"
-    if trained_dest_path.exists() and params_path.exists():
-        return
-
-    # extract a "train" set and a "test" set, which is actually ground-truth
-    # queries to be held out from the making of a provisional index
     if args.clusters is None:
-        clusters = (len(dataset) - args.queries) // TRAIN_SIZE_MULTIPLE
+        clusters = len(dataset) // TRAIN_SIZE_MULTIPLE
     else:
         clusters = args.clusters
     factory_string = f"{args.preprocess},IVF{clusters},{args.ivf_encoding}"
     train_size = TRAIN_SIZE_MULTIPLE * clusters
-    splits = dataset.train_test_split(args.queries, train_size, seed=42)
-    train = splits["train"]
-    queries = splits["test"]
+
+    shuffled = dataset.shuffle(seed=42)
+    train = shuffled.take(train_size)
 
     # train index and Pareto-optimal params from splits
     with TemporaryDirectory(dir=CACHE) as tmpdir:
         tmpdir = Path(tmpdir)
         working_dir = CACHE if args.use_cache else tmpdir
 
+        empty_index_path = train_index(train, factory_string, working_dir, args)
+        with del_on_exc([args.empty_index_path, args.untuned_params_path]):
+            copy(empty_index_path, args.empty_index_path)
+            save_params(args.untuned_params_path, args.dimensions, args.normalize, None)
+
+
+def ensure_tuned(dataset: Dataset, args: TuneArgs) -> None:
+    # the queries is to be held out from the making of a provisional index
+    # TODO: turn this into a function with choice of split
+    shuffled = dataset.shuffle(seed=42)
+    queries = shuffled.skip(len(shuffled) - args.queries - 1)
+
+    # TODO: turn the yield of both tmpdir and working_dir into a function?
+    with TemporaryDirectory(dir=CACHE) as tmpdir:
+        tmpdir = Path(tmpdir)
+        working_dir = CACHE if args.use_cache else tmpdir
+
         ground_truth = make_ground_truth(dataset, queries, working_dir, args)
-        trained_path = train_index(train, factory_string, working_dir, args)
 
         with queries.formatted_as("torch"):
             q_ids: torch.Tensor = queries["index"]  # type: ignore
-        make_index(tmpdir, trained_path, dataset, q_ids, working_dir, args)
+        make_index(tmpdir, args.empty_index_path, dataset, q_ids, working_dir, args)
         merged_index = open_ondisk(tmpdir)
         optimal_params = tune_index(merged_index, ground_truth, args)
 
-        with del_on_exc([trained_dest_path, params_path]):
-            copy(trained_path, trained_dest_path)
-            save_params(params_path, args.dimensions, args.normalize, optimal_params)
+    with del_on_exc(args.params_path):
+        save_params(args.params_path, args.dimensions, args.normalize, optimal_params)
 
 
 def ensure_filled(dataset: Dataset, args: FillArgs) -> None:
-    # TODO: make make_index take index_paths entries?
     with del_on_exc([args.ids_path, *args.index_paths]):
         save_ids(args.ids_path, dataset)
-        make_index(args.dest, args.trained_path, dataset, None, CACHE, args)
+        make_index(args.build_dir, args.empty_index_path, dataset, None, CACHE, args)
 
 
 def main():
@@ -689,6 +733,8 @@ def main():
             args = CleanArgs.from_namespace(args)
         elif args.mode == "train":
             args = TrainArgs.from_namespace(args)
+        elif args.mode == "tune":
+            args = TuneArgs.from_namespace(args)
         else:  # args.mode == "fill"
             args = FillArgs.from_namespace(args)
     except ValueError as e:
@@ -710,11 +756,13 @@ def main():
 
     # prepare source dataset and destination directory
     dataset = load_dataset(args.source)
-    if not args.dest.exists():
-        args.dest.mkdir()
+    if not args.build_dir.exists():
+        args.build_dir.mkdir()
 
     if args.mode == "train":
         ensure_trained(dataset, args)
+    elif args.mode == "tune":
+        ensure_tuned(dataset, args)
     else:  # args.mode == "fill"
         ensure_filled(dataset, args)
 
