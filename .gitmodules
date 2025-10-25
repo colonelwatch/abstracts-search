@@ -1,6 +1,0 @@
-[submodule "abstracts-embeddings"]
-	path = abstracts-embeddings
-	url = git@hf.co:datasets/colonelwatch/abstracts-embeddings
-[submodule "abstracts-faiss"]
-	path = abstracts-faiss
-	url = git@hf.co:datasets/colonelwatch/abstracts-faiss

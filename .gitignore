@@ -6,3 +6,5 @@ remote_targets.mk
 oa_jsonl
 __pycache__
 env.mk
+abstracts-faiss
+abstracts-embeddings
