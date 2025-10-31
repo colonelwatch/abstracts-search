@@ -23,9 +23,13 @@ $(INDEX_DIR)/params.json: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
 $(INDEX_TRAIN_TARGETS) &: | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
 
+# TODO: better handle the already existing directory
 include remote_targets.mk
 EQ := =
-$(DATA_DIR) abstracts-embeddings/events &: | $(events)
+$(DATA_DIR) abstracts-embeddings/events &: $(events)
+	if [ -d $(DATA_DIR) ]; then	\
+		rm -rf $(DATA_DIR);	\
+	fi
 	$(PYTHON) dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
 
