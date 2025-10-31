@@ -131,7 +131,7 @@ def dump_database(
         dim = embedding.fetchone()[0].shape[0]
 
         # iterate through this massive query in chunks
-        cursor = conn.execute("SELECT * FROM embeddings")
+        cursor = conn.execute("SELECT * FROM embeddings ORDER BY rowid")
         chunks = to_chunks(cursor, row_group_size)
 
         id_ = 0  # shard id
