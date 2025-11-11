@@ -7,19 +7,19 @@ from typing import Any, Callable, Concatenate, Generator, Iterable, Literal, ove
 import torch
 
 
-@overload  # noqa: E302
+@overload
 def iunzip[T, U](
     tups: Iterable[tuple[T, U]], n: Literal[2]
 ) -> tuple[Iterable[T], Iterable[U]]: ...
 
 
-@overload  # noqa: E302
+@overload
 def iunzip[T, U, V](
     tups: Iterable[tuple[T, U, V]], n: Literal[3]
 ) -> tuple[Iterable[T], Iterable[U], Iterable[V]]: ...
 
 
-def iunzip(tups: Iterable[tuple], n: int) -> tuple[Iterable, ...]:  # noqa: E302
+def iunzip(tups: Iterable[tuple], n: int) -> tuple[Iterable, ...]:
     # https://stackoverflow.com/a/77797926
     tees = tee(tups, n)
 
@@ -44,7 +44,7 @@ def imap[T, U_contra](
 ) -> Generator[T, None, None]: ...
 
 
-@overload  # noqa: E302
+@overload
 def imap[T, U_contra, V_contra](
     inputs: Iterable[tuple[U_contra, V_contra]],
     func: Callable[[U_contra, V_contra], T],
@@ -52,7 +52,7 @@ def imap[T, U_contra, V_contra](
 ) -> Generator[T, None, None]: ...
 
 
-@overload  # noqa: E302
+@overload
 def imap[T, U_contra, V_contra, W_contra](
     inputs: Iterable[tuple[U_contra, V_contra, W_contra]],
     func: Callable[[U_contra, V_contra, W_contra], T],
@@ -60,7 +60,7 @@ def imap[T, U_contra, V_contra, W_contra](
 ) -> Generator[T, None, None]: ...
 
 
-def imap[T](  # noqa: E302
+def imap[T](
     inputs: Iterable[tuple],
     func: Callable[..., T],
     n_tasks: int,
@@ -95,21 +95,21 @@ def imap_multi_gpu[T, U_contra](
 ) -> Generator[T, None, None]: ...
 
 
-@overload  # noqa: E302
+@overload
 def imap_multi_gpu[T, U_contra, V_contra](
     inputs: Iterable[tuple[U_contra, V_contra]],
     func: Callable[[torch.device, U_contra, V_contra], T],
 ) -> Generator[T, None, None]: ...
 
 
-@overload  # noqa: E302
+@overload
 def imap_multi_gpu[T, U_contra, V_contra, W_contra](
     inputs: Iterable[tuple[U_contra, V_contra, W_contra]],
     func: Callable[[torch.device, U_contra, V_contra, W_contra], T],
 ) -> Generator[T, None, None]: ...
 
 
-def imap_multi_gpu[T](  # noqa: E302
+def imap_multi_gpu[T](
     inputs: Iterable[tuple],
     func: Callable[Concatenate[torch.device, ...], T],
 ) -> Generator[T, None, None]:
