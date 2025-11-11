@@ -181,7 +181,7 @@ class TuneArgs(Args):
     def configure_parser(parser: ArgumentParser) -> None:
         parser.add_argument("source", type=Path)
         parser.add_argument("-k", "--intersection", default=None, type=int)
-        parser.add_argument("-q", "--queries", action="store_true")
+        parser.add_argument("-q", "--queries", default=8192, type=int)
 
     def __post_init__(self):
         super().__post_init__()
@@ -698,11 +698,8 @@ def ensure_trained(dataset: Dataset, args: TrainArgs):
 
 def ensure_tuned(dataset: Dataset, args: TuneArgs) -> None:
     # the queries is to be held out from the making of a provisional index
-    # TODO: turn this into a function with choice of split
-    shuffled = dataset.shuffle(seed=42)
-    queries = shuffled.skip(len(shuffled) - args.queries - 1)
+    queries = dataset.shuffle(seed=42).skip(len(dataset) - args.queries)
 
-    # TODO: turn the yield of both tmpdir and working_dir into a function?
     with TemporaryDirectory(dir=CACHE) as tmpdir:
         tmpdir = Path(tmpdir)
         working_dir = CACHE if args.use_cache else tmpdir
