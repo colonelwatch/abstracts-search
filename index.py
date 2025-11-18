@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import warnings
+from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -26,7 +27,7 @@ from pathlib import Path
 from shutil import copy, rmtree
 from sys import stderr
 from tempfile import TemporaryDirectory
-from typing import Any, Generator, Iterable, Literal, Self, TypedDict
+from typing import Any, Generator, Iterable, Literal, Self, TypedDict, Unpack
 
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
 import numpy as np
@@ -38,6 +39,7 @@ from datasets.fingerprint import Hasher
 from faiss.contrib.ondisk import merge_ondisk
 from tqdm import tqdm
 
+from utils.cache_utils import get_cache_dir, seal_persistent_cache
 from utils.env_utils import CACHE
 from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
@@ -282,6 +284,31 @@ def hash(parameters: list) -> str:
     return h.hexdigest()
 
 
+class Provisioner[T](ABC):
+    def __init__(self, **kwargs: Any) -> None:
+        self._kwargs = kwargs
+
+    @abstractmethod
+    def provision(self, progress: bool = False) -> T: ...
+
+    def _compute_cache_path(self) -> Path:
+        return get_cache_dir() / self._compute_cache_identifier()
+
+    @abstractmethod
+    def _compute_cache_identifier(self) -> str:
+        return self._compute_cache_hash()
+
+    def _compute_cache_hash(self) -> str:
+        sorted_keys = sorted(self._kwargs.keys())
+        hasher = Hasher()
+        for k in sorted_keys:
+            v = self._kwargs[k]
+            if isinstance(v, Dataset):
+                v = v._fingerprint
+            hasher.update(v)
+        return hasher.hexdigest()
+
+
 def iter_tensors(
     dataset: Dataset,
 ) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
@@ -290,73 +317,121 @@ def iter_tensors(
             yield batch["index"], batch["embedding"]  # type: ignore
 
 
-# NOTE: ground truth is computed with the full embedding length
-def make_ground_truth(
-    dataset: Dataset, queries: Dataset, cache_dir: Path, args: TuneArgs
-) -> Dataset:
-    cache_identifier = hash(
-        [dataset._fingerprint, queries._fingerprint, args.normalize, args.k]
-    )
-    cache_path = cache_dir / f"gt_{cache_identifier}"
-    if cache_path.exists():
-        return Dataset.load_from_disk(cache_path)
+class GroundTruthInputs(TypedDict):
+    dataset: Dataset
+    queries: Dataset
+    do_inner_product_search: bool
+    k: int
 
-    with queries.formatted_as("torch", columns=["embedding", "index"]):
-        q_embeddings: torch.Tensor = queries["embedding"]  # type: ignore
-        q_ids: torch.Tensor = queries["index"]  # type: ignore
 
-        if args.normalize:
+class GroundTruthBuilder:
+    def __init__(self, **kwargs: Unpack[GroundTruthInputs]) -> None:
+        dataset = kwargs["dataset"]
+        queries = kwargs["queries"]
+        do_inner_product_search = kwargs["do_inner_product_search"]
+        k = kwargs["k"]
+
+        self._dataset = dataset
+        self._queries = queries
+        self._do_inner_product_search = do_inner_product_search
+        self._k = k
+
+        # get query embeddings and IDs, with a local copy for each GPU
+        with queries.formatted_as("torch", columns=["embedding", "index"]):
+            q_embeddings: torch.Tensor = queries["embedding"]  # type: ignore
+            q_ids: torch.Tensor = queries["index"]  # type: ignore
+        if do_inner_product_search:
             q_embeddings = torch.nn.functional.normalize(q_embeddings)
+        n_devices = torch.cuda.device_count()
+        self._q_embeddings = q_embeddings
+        self._q_ids = q_ids
+        self._n_devices = n_devices
+        self._q_embeddings_copy = [
+            q_embeddings.to(f"cuda:{i}") for i in range(n_devices)
+        ]
+        self._q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
 
-    # make available a local copy to each GPU
-    n_devices = torch.cuda.device_count()
-    q_embeddings_copy = [q_embeddings.to(f"cuda:{i}") for i in range(n_devices)]
-    q_ids_copy = [q_ids.to(f"cuda:{i}") for i in range(n_devices)]
+    def build(self, progress: bool = False) -> Dataset:
+        # initialize the top k
+        n_q, _ = self._q_embeddings.shape
+        shape = (n_q, self._k)
+        gt_ids = torch.full(shape, -1, dtype=torch.int32).cuda()
+        if self._do_inner_product_search:
+            gt_scores = torch.zeros(shape, dtype=torch.float32).cuda()
+        else:
+            gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
 
-    # for unit vectors, the L2 minimizing is also the inner-product maximizing
-    inner_product_search = args.normalize
+        with tqdm(
+            desc="make_ground_truth",
+            total=len(self._dataset),
+            disable=(not progress),
+        ) as counter:
+            batches = iter_tensors(self._dataset)
+            batches, batches_copy = tee(batches, 2)
+            lengths = imap(batches_copy, self._get_length, 0)
+            batches = imap_multi_gpu(batches, self._local_topk)
+            batches = accumulate(
+                batches, self._reduce_topk, initial=(gt_ids, gt_scores)
+            )
+            batches = zip(lengths, batches)
+            for length, (gt_ids, _) in batches:
+                counter.update(length)
 
-    def get_length(ids: torch.Tensor, _: torch.Tensor) -> int:
+        gt_ids = gt_ids.cpu()
+
+        ground_truth = Dataset.from_dict(
+            {
+                "embedding": self._q_embeddings,
+                "gt_ids": gt_ids.numpy(),
+            }
+        )
+        return ground_truth
+
+    def _get_length(self, ids: torch.Tensor, _: torch.Tensor) -> int:
         return len(ids)
 
-    def local_topk(
-        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
+    # NOTE: ground truth is computed with the full embedding length
+    def _local_topk(
+        self, device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # send to GPU asynchronously
         embeddings = embeddings.to(device, non_blocking=True)
         ids = ids.to(device, non_blocking=True)
 
+        # acquire device copy of queries
+        q_ids = self._q_ids_copy[device.index]
+        q_embeddings = self._q_embeddings_copy[device.index]
+
         # don't consider the queries themselves as possible ground truth
-        not_in_queries = torch.isin(ids, q_ids_copy[device.index], invert=True)
+        not_in_queries = torch.isin(ids, q_ids, invert=True)
         embeddings = embeddings[not_in_queries]
         ids = ids[not_in_queries]
 
-        if inner_product_search:
+        if self._do_inner_product_search:
             # ensure that the vectors are unit-length
             embeddings = torch.nn.functional.normalize(embeddings)
 
             # becomes a matmult for multiple data
-            scores = q_embeddings_copy[device.index] @ embeddings.T
+            scores = q_embeddings @ embeddings.T
         else:
             # prefer direct calc over following the quadratic form with matmult
             scores = torch.cdist(
-                q_embeddings_copy[device.index],
-                embeddings,
-                compute_mode="donot_use_mm_for_euclid_dist",
+                q_embeddings, embeddings, compute_mode="donot_use_mm_for_euclid_dist"
             )
 
         # only yield k from this batch, in the extreme this k replaces all running k
         top_scores, argtop = torch.topk(
-            scores, args.k, dim=1, largest=inner_product_search
+            scores, self._k, dim=1, largest=self._do_inner_product_search
         )
         top_ids = ids[argtop.flatten()].reshape(argtop.shape)
 
-        if n_devices > 1:
+        if self._n_devices > 1:
             return top_ids.cpu(), top_scores.cpu()
         else:
             return top_ids, top_scores  # reduce step is on this GPU
 
-    def reduce_topk(
+    def _reduce_topk(
+        self,
         gt: tuple[torch.Tensor, torch.Tensor],
         batch_top: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -370,84 +445,119 @@ def make_ground_truth(
         gt_scores = torch.hstack((gt_scores, batch_scores))
         gt_ids = torch.hstack((gt_ids, batch_ids))
         gt_scores, argtop = torch.topk(
-            gt_scores, args.k, dim=1, largest=inner_product_search
+            gt_scores, self._k, dim=1, largest=self._do_inner_product_search
         )
         gt_ids = torch.gather(gt_ids, 1, argtop)
 
         return gt_ids, gt_scores
 
-    # initialize the top k
-    n_q, _ = q_embeddings.shape
-    shape = (n_q, args.k)
-    gt_ids = torch.full(shape, -1, dtype=torch.int32).cuda()
-    if inner_product_search:
-        gt_scores = torch.zeros(shape, dtype=torch.float32).cuda()
-    else:
-        gt_scores = torch.full(shape, torch.inf, dtype=torch.float32).cuda()
 
-    with tqdm(
-        desc="make_ground_truth", total=len(dataset), disable=(not args.progress)
-    ) as counter:
-        batches = iter_tensors(dataset)
-        batches, batches_copy = tee(batches, 2)
-        lengths = imap(batches_copy, get_length, 0)
-        batches = imap_multi_gpu(batches, local_topk)
-        batches = accumulate(batches, reduce_topk, initial=(gt_ids, gt_scores))
-        batches = zip(lengths, batches)
-        for length, (gt_ids, _) in batches:
-            counter.update(length)
+class GroundTruthProvisioner(Provisioner[Dataset]):
+    def __init__(self, **kwargs: Unpack[GroundTruthInputs]) -> None:
+        super().__init__(**kwargs)
 
-    gt_ids = gt_ids.cpu()
+    @classmethod
+    def with_tune_args(cls, dataset: Dataset, queries: Dataset, args: TuneArgs) -> Self:
+        # for unit vectors, the L2 minimizing is also the inner-product maximizing
+        return cls(
+            dataset=dataset,
+            queries=queries,
+            do_inner_product_search=args.normalize,
+            k=args.k,
+        )
 
-    ground_truth = Dataset.from_dict(
-        {
-            "embedding": q_embeddings,
-            "gt_ids": gt_ids.numpy(),
-        }
-    )
-    ground_truth.save_to_disk(cache_path)
-    return ground_truth
+    def provision(self, progress: bool = False) -> Dataset:
+        cache_path = self._compute_cache_path()
+        if cache_path.exists():
+            return Dataset.load_from_disk(cache_path)
+        builder = GroundTruthBuilder(**self._kwargs)
+        ground_truth = builder.build(progress=progress)
+        ground_truth.save_to_disk(cache_path)
+        return ground_truth
+
+    def _compute_cache_identifier(self) -> str:
+        return f"gt_{self._compute_cache_hash()}"
 
 
-def create_memmap(
-    dataset: Dataset, cache_dir: Path, args: TrainArgs
-) -> np.memmap[Any, np.dtype[np.float32]]:
-    n = len(dataset)
-    d = len(dataset[0]["embedding"]) if args.dimensions is None else args.dimensions
-    shape = (n, d)
+class MemmapInputs(TypedDict):
+    dataset: Dataset
+    shape: tuple[int, int]
+    normalize: bool
 
-    cache_identifier = hash([dataset._fingerprint, args.dimensions, args.normalize])
-    cache_path = cache_dir / f"train_{cache_identifier}.memmap"
-    if cache_path.exists():
-        return np.memmap(cache_path, np.float32, mode="r", shape=shape)
 
-    def preproc(_, embeddings: torch.Tensor) -> torch.Tensor:
-        if args.dimensions is not None:
-            embeddings = embeddings[:, : args.dimensions]
-        if args.normalize:
+type NDMemmap[T: np.generic] = np.memmap[Any, np.dtype[T]]
+
+
+class MemmapBuilder:
+    def __init__(self, **kwargs: Unpack[MemmapInputs]) -> None:
+        self._dataset = kwargs["dataset"]
+        self._shape = kwargs["shape"]
+        self._normalize = kwargs["normalize"]
+
+    def build(self, path: Path, progress: bool = False) -> NDMemmap[np.float32]:
+        n, _ = self._shape
+        i = 0
+        memmap = np.memmap(path, np.float32, mode="w+", shape=self._shape)
+        with (
+            del_on_exc(path),
+            tqdm(desc="create_memmap", total=n, disable=(not progress)) as counter,
+        ):
+            # save batches to disk by assigning to memmap slices
+            batches = iter_tensors(self._dataset)
+            batches = imap(batches, self._preproc, -1)
+            for embeddings_batch in batches:
+                n_batch = len(embeddings_batch)
+
+                if i + n_batch > n:
+                    n_batch = n - i
+                    embeddings_batch = embeddings_batch[:n_batch]
+
+                memmap[i : (i + n_batch)] = embeddings_batch.numpy()
+                i += n_batch
+                counter.update(n_batch)
+
+                if i >= n:
+                    break
+
+            # memmap holds (now) leaked memory, so flush...
+            memmap.flush()
+
+        # ... and recreate memmap, letting the original go out-of-scope
+        return np.memmap(path, np.float32, mode="r", shape=self._shape)
+
+    def _preproc(self, _, embeddings: torch.Tensor) -> torch.Tensor:
+        _, d = self._shape
+        embeddings = embeddings[:, :d]
+        if embeddings.shape[1] != d:
+            raise ValueError("embeddings dimensions was less than d")
+        if self._normalize:
             embeddings = torch.nn.functional.normalize(embeddings)
         return embeddings
 
-    i = 0
-    memmap = np.memmap(cache_path, np.float32, mode="w+", shape=shape)
-    with (
-        del_on_exc(cache_path),
-        tqdm(
-            desc="create_memmap", total=len(dataset), disable=(not args.progress)
-        ) as counter,
-    ):
-        batches = iter_tensors(dataset)
-        batches = imap(batches, preproc, -1)
-        for embeddings_batch in batches:
-            # save batches to disk by assigning to memmap slices
-            n_batch = len(embeddings_batch)
-            memmap[i : (i + n_batch)] = embeddings_batch.numpy()
-            i += n_batch
-            counter.update(n_batch)
 
-    # flush from RAM to disk, then destroy the object on RAM and recreate from disk
-    memmap.flush()
-    return np.memmap(cache_path, np.float32, mode="r", shape=shape)
+class MemmapProvisioner(Provisioner[NDMemmap[np.float32]]):
+    def __init__(self, **kwargs: Unpack[MemmapInputs]) -> None:
+        super().__init__(**kwargs)
+        self._shape = kwargs["shape"]
+
+    @classmethod
+    def with_train_args(cls, dataset: Dataset, args: TrainArgs) -> Self:
+        n = len(dataset)
+        d = args.dimensions
+        if d is None:
+            d = len(dataset[0]["embedding"])
+        return cls(dataset=dataset, shape=(n, d), normalize=args.normalize)
+
+    def provision(self, progress: bool = False) -> NDMemmap[np.float32]:
+        cache_path = self._compute_cache_path()
+        if cache_path.exists():
+            return np.memmap(cache_path, np.float32, mode="r", shape=self._shape)
+        builder = MemmapBuilder(**self._kwargs)
+        memmap = builder.build(cache_path, progress=progress)
+        return memmap
+
+    def _compute_cache_identifier(self) -> str:
+        return f"train_{self._compute_cache_hash()}.memmap"
 
 
 def to_gpu(index: faiss.Index, device: int = 0) -> faiss.Index:
@@ -471,7 +581,8 @@ def train_index(
     if cache_path.exists():
         return cache_path
 
-    train_memmap = create_memmap(train, cache_dir, args)
+    provisioner = MemmapProvisioner.with_train_args(train, args)
+    train_memmap = provisioner.provision(progress=args.progress)
 
     # doing a bit of testing seems to show that passing METRIC_L2 is superior to passing
     # METRIC_INNER_PRODUCT for the same factory string, even for normalized embeddings
@@ -704,7 +815,8 @@ def ensure_tuned(dataset: Dataset, args: TuneArgs) -> None:
         tmpdir = Path(tmpdir)
         working_dir = CACHE if args.use_cache else tmpdir
 
-        ground_truth = make_ground_truth(dataset, queries, working_dir, args)
+        provisioner = GroundTruthProvisioner.with_tune_args(dataset, queries, args)
+        ground_truth = provisioner.provision(progress=args.progress)
 
         with queries.formatted_as("torch"):
             q_ids: torch.Tensor = queries["index"]  # type: ignore
@@ -745,6 +857,7 @@ def main():
     if not args.use_cache:
         # run through global huggingface datasets settings
         disable_caching()
+        seal_persistent_cache()
     else:
         CACHE.mkdir(exist_ok=True)
 
