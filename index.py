@@ -317,7 +317,7 @@ def iter_tensors(
             yield batch["index"], batch["embedding"]  # type: ignore
 
 
-class GroundTruthInputs(TypedDict):
+class GroundTruthKwargs(TypedDict):
     dataset: Dataset
     queries: Dataset
     do_inner_product_search: bool
@@ -325,7 +325,7 @@ class GroundTruthInputs(TypedDict):
 
 
 class GroundTruthBuilder:
-    def __init__(self, **kwargs: Unpack[GroundTruthInputs]) -> None:
+    def __init__(self, **kwargs: Unpack[GroundTruthKwargs]) -> None:
         dataset = kwargs["dataset"]
         queries = kwargs["queries"]
         do_inner_product_search = kwargs["do_inner_product_search"]
@@ -453,7 +453,7 @@ class GroundTruthBuilder:
 
 
 class GroundTruthProvisioner(Provisioner[Dataset]):
-    def __init__(self, **kwargs: Unpack[GroundTruthInputs]) -> None:
+    def __init__(self, **kwargs: Unpack[GroundTruthKwargs]) -> None:
         super().__init__(**kwargs)
 
     @classmethod
@@ -479,7 +479,7 @@ class GroundTruthProvisioner(Provisioner[Dataset]):
         return f"gt_{self._compute_cache_hash()}"
 
 
-class MemmapInputs(TypedDict):
+class MemmapKwargs(TypedDict):
     dataset: Dataset
     shape: tuple[int, int]
     normalize: bool
@@ -489,7 +489,7 @@ type NDMemmap[T: np.generic] = np.memmap[Any, np.dtype[T]]
 
 
 class MemmapBuilder:
-    def __init__(self, **kwargs: Unpack[MemmapInputs]) -> None:
+    def __init__(self, **kwargs: Unpack[MemmapKwargs]) -> None:
         self._dataset = kwargs["dataset"]
         self._shape = kwargs["shape"]
         self._normalize = kwargs["normalize"]
@@ -536,7 +536,7 @@ class MemmapBuilder:
 
 
 class MemmapProvisioner(Provisioner[NDMemmap[np.float32]]):
-    def __init__(self, **kwargs: Unpack[MemmapInputs]) -> None:
+    def __init__(self, **kwargs: Unpack[MemmapKwargs]) -> None:
         super().__init__(**kwargs)
         self._shape = kwargs["shape"]
 
