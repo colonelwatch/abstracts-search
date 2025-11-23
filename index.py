@@ -571,16 +571,7 @@ def to_cpu(index: faiss.Index) -> faiss.Index:
     return faiss.index_gpu_to_cpu(index)
 
 
-def train_index(
-    train: Dataset, factory_string: str, cache_dir: Path, args: TrainArgs
-) -> Path:
-    cache_identifier = hash(  # includes create_memmap parameters
-        [train._fingerprint, factory_string, args.dimensions, args.normalize]
-    )
-    cache_path = cache_dir / f"empty_{cache_identifier}.faiss"
-    if cache_path.exists():
-        return cache_path
-
+def train_index(train: Dataset, factory_string: str, args: TrainArgs) -> faiss.Index:
     provisioner = MemmapProvisioner.with_train_args(train, args)
     train_memmap = provisioner.provision(progress=args.progress)
 
@@ -593,8 +584,7 @@ def train_index(
     index.train(train_memmap)  # type: ignore (monkey-patched)
     index = to_cpu(index)
 
-    faiss.write_index(index, str(cache_path))
-    return cache_path
+    return index
 
 
 def make_index(
@@ -796,15 +786,10 @@ def ensure_trained(dataset: Dataset, args: TrainArgs):
     shuffled = dataset.shuffle(seed=42)
     train = shuffled.take(train_size)
 
-    # train index and Pareto-optimal params from splits
-    with TemporaryDirectory(dir=CACHE) as tmpdir:
-        tmpdir = Path(tmpdir)
-        working_dir = CACHE if args.use_cache else tmpdir
-
-        empty_index_path = train_index(train, factory_string, working_dir, args)
-        with del_on_exc([args.empty_index_path, args.untuned_params_path]):
-            copy(empty_index_path, args.empty_index_path)
-            save_params(args.untuned_params_path, args.dimensions, args.normalize, None)
+    index = train_index(train, factory_string, args)
+    with del_on_exc([args.empty_index_path, args.untuned_params_path]):
+        faiss.write_index(index, str(args.empty_index_path))
+        save_params(args.untuned_params_path, args.dimensions, args.normalize, None)
 
 
 def ensure_tuned(dataset: Dataset, args: TuneArgs) -> None:
