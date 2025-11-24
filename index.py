@@ -16,6 +16,7 @@
 
 import json
 import logging
+import os
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -26,7 +27,6 @@ from itertools import accumulate, tee
 from pathlib import Path
 from shutil import copy, rmtree
 from sys import stderr
-from tempfile import TemporaryDirectory
 from typing import Any, Generator, Iterable, Literal, Self, TypedDict, Unpack
 
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
@@ -277,13 +277,6 @@ def load_dataset(dir: Path) -> Dataset:
     return dataset.add_column("index", ids)  # type: ignore  (wrong func signature)
 
 
-def hash(parameters: list) -> str:
-    h = Hasher()
-    for parameter in parameters:
-        h.update(parameter)
-    return h.hexdigest()
-
-
 class Provisioner[T](ABC):
     def __init__(self, **kwargs: Any) -> None:
         self._kwargs = kwargs
@@ -305,6 +298,10 @@ class Provisioner[T](ABC):
             v = self._kwargs[k]
             if isinstance(v, Dataset):
                 v = v._fingerprint
+            if isinstance(v, Path):
+                if not v.exists():
+                    raise ValueError("input file does not exist")
+                v = (v, os.path.getmtime(v))
             hasher.update(v)
         return hasher.hexdigest()
 
@@ -587,96 +584,153 @@ def train_index(train: Dataset, factory_string: str, args: TrainArgs) -> faiss.I
     return index
 
 
-def make_index(
-    dir: Path,
-    empty_index_path: Path,
-    dataset: Dataset,
-    holdouts: torch.Tensor | None,
-    cache_dir: Path,
-    args: TuneArgs | FillArgs,
-) -> None:
-    holdout_list = [] if holdouts is None else holdouts.tolist()
-    cache_identifier = hash([empty_index_path, dataset._fingerprint, *holdout_list])
+class MakeIndexKwargs(TypedDict):
+    empty_index_path: Path
+    dataset: Dataset
+    holdouts: torch.Tensor | None
+    d: int
+    normalize: bool
 
-    index_cache_path = cache_dir / f"filled_{cache_identifier}.faiss"
-    ondisk_cache_path = cache_dir / f"ondisk_{cache_identifier}.ivfdata"
-    if index_cache_path.exists() and ondisk_cache_path.exists():
-        copy(index_cache_path, dir / "index.faiss")
-        copy(ondisk_cache_path, dir / "ondisk.ivfdata")
-        return
 
-    # clone trained index for filling on the GPU and merging on the CPU
-    trained_index = faiss.read_index(str(empty_index_path))
-    on_gpus: list[faiss.Index] = [
-        to_gpu(trained_index) for _ in range(torch.cuda.device_count())
-    ]
-    index: faiss.Index = faiss.clone_index(trained_index)
+@dataclass
+class MakeIndexOutput:
+    dir: Path
 
-    def preproc(
-        ids: torch.Tensor, embeddings: torch.Tensor
+    @property
+    def index_path(self) -> Path:
+        return self.dir / "index.faiss"
+
+    @property
+    def ondisk_path(self) -> Path:
+        return self.dir / "ondisk.ivfdata"
+
+    def open(self) -> faiss.Index:
+        # without IO_FLAG_ONDISK_SAME_DIR, read_index loads from working dir
+        return faiss.read_index(str(self.index_path), faiss.IO_FLAG_ONDISK_SAME_DIR)
+
+
+class MakeIndexBuilder:
+    def __init__(self, **kwargs: Unpack[MakeIndexKwargs]) -> None:
+        self._dataset = kwargs["dataset"]
+        self._holdouts = kwargs["holdouts"]
+        self._d = kwargs["d"]
+        self._normalize = kwargs["normalize"]
+
+        index = faiss.read_index(str(kwargs["empty_index_path"]))
+
+        self._index = index
+        self._on_gpus = [to_gpu(index, i) for i in range(torch.cuda.device_count())]
+
+    def build(self, dir: Path, progress: bool = False) -> MakeIndexOutput:
+        output_paths = MakeIndexOutput(dir)
+        shard_paths: list[Path] = []
+        try:
+            n_full = len(self._dataset)
+            n = n_full if self._holdouts is None else n_full - len(self._holdouts)
+            with tqdm(desc="make_index", total=n, disable=(not progress)) as c:
+                for i_shard, row_start in enumerate(range(0, n_full, SHARD_SIZE)):
+                    shard = self._dataset.select(  # yields another Datset not rows
+                        range(row_start, min(row_start + SHARD_SIZE, n_full))
+                    )
+
+                    batches = iter_tensors(shard)
+                    batches = imap(batches, self._preproc, -1)
+                    counts = imap_multi_gpu(batches, self._add_with_gpu)
+                    for count in counts:
+                        c.update(count)
+
+                    # transfer takes time, so do this across all GPUs in parallel
+                    on_gpus = iunsqueeze(self._on_gpus)
+                    for on_cpu in imap(on_gpus, self._transfer_and_reset, -1):
+                        self._index.merge_from(on_cpu)
+
+                    shard_path = dir / f"shard_{i_shard:03d}.faiss"
+                    faiss.write_index(self._index, str(shard_path))
+                    shard_paths.append(shard_path)
+
+                    self._index.reset()
+
+            # merge_ondisk takes file _names_ and only puts in working directory...
+            temp_ondisk_path = Path("./ondisk.ivfdata")
+            ondisk_path = output_paths.ondisk_path
+            with del_on_exc([temp_ondisk_path, ondisk_path]):
+                merge_ondisk(
+                    self._index, [str(p) for p in shard_paths], temp_ondisk_path.name
+                )
+                temp_ondisk_path.rename(ondisk_path)  # ... so move it after
+        finally:
+            # drop the shards
+            for p in shard_paths:
+                p.unlink()
+
+        # write the index (which points to `ondisk.ivfdata`)
+        index_path = output_paths.index_path
+        with del_on_exc(index_path):
+            faiss.write_index(self._index, str(index_path))
+
+        return output_paths
+
+    def _preproc(
+        self, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if holdouts is not None:
-            not_in = torch.isin(ids, holdouts, invert=True)
+        if self._holdouts is not None:
+            not_in = torch.isin(ids, self._holdouts, invert=True)
             ids = ids[not_in]
             embeddings = embeddings[not_in]
-        if args.dimensions is not None:
-            embeddings = embeddings[:, : args.dimensions]
-        if args.normalize:
+        embeddings = embeddings[:, : self._d]
+        if self._normalize:
             embeddings = torch.nn.functional.normalize(embeddings)
         return ids, embeddings
 
-    def add_with_gpu(
-        device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
+    def _add_with_gpu(
+        self, device: torch.device, ids: torch.Tensor, embeddings: torch.Tensor
     ) -> int:
-        on_gpu = on_gpus[device.index]
+        on_gpu = self._on_gpus[device.index]
         on_gpu.add_with_ids(embeddings.numpy(), ids.numpy())  # type: ignore
         return len(ids)  # yield the number of embeddings added
 
-    def transfer_and_reset(on_gpu: faiss.Index) -> faiss.Index:
+    def _transfer_and_reset(self, on_gpu: faiss.Index) -> faiss.Index:
         on_cpu = to_cpu(on_gpu)
         on_gpu.reset()
         return on_cpu
 
-    # write shards to disk because holding them all in RAM causes OOM-kill
-    shard_paths: list[Path] = []
-    try:
-        n_ids = (len(dataset) - len(holdouts)) if holdouts is not None else len(dataset)
-        with tqdm(desc="make_index", total=n_ids, disable=(not args.progress)) as c:
-            for i_shard, row_start in enumerate(range(0, len(dataset), SHARD_SIZE)):
-                shard = dataset.select(  # yields another Datset not rows
-                    range(row_start, min(row_start + SHARD_SIZE, len(dataset)))
-                )
 
-                batches = iter_tensors(shard)
-                batches = imap(batches, preproc, -1)
-                counts = imap_multi_gpu(batches, add_with_gpu)
-                for count in counts:
-                    c.update(count)
+class MakeIndexProvisioner(Provisioner[MakeIndexOutput]):
+    def __init__(self, **kwargs: Unpack[MakeIndexKwargs]) -> None:
+        super().__init__(**kwargs)
 
-                # transfer takes time, so do this across all GPUs in parallel
-                for on_cpu in imap(iunsqueeze(on_gpus), transfer_and_reset, -1):
-                    index.merge_from(on_cpu)
+    @classmethod
+    def with_args(
+        cls,
+        dataset: Dataset,
+        holdouts: torch.Tensor | None,
+        args: FillArgs | TuneArgs,
+    ) -> Self:
+        d = args.dimensions
+        if d is None:
+            d = len(dataset[0]["embedding"])  # TODO: make this a function?
+        return cls(
+            empty_index_path=args.empty_index_path,
+            dataset=dataset,
+            holdouts=holdouts,
+            d=d,
+            normalize=args.normalize,
+        )
 
-                shard_path = dir / f"shard_{i_shard:03d}.faiss"
-                faiss.write_index(index, str(shard_path))
-                shard_paths.append(shard_path)
+    def provision(self, progress: bool = False) -> MakeIndexOutput:
+        cache_path = self._compute_cache_path()
+        if cache_path.exists():
+            return MakeIndexOutput(dir=cache_path)
 
-                index.reset()
+        builder = MakeIndexBuilder(**self._kwargs)
+        with del_on_exc(cache_path):
+            cache_path.mkdir()
+            out = builder.build(cache_path, progress=progress)
 
-        # merge_ondisk takes file _names_ and only puts in working directory...
-        ondisk_relpath = Path("./ondisk.ivfdata")
-        merge_ondisk(index, [str(p) for p in shard_paths], ondisk_relpath.name)
-        ondisk_relpath.rename(dir / ondisk_relpath)  # ... so move it after
-    finally:
-        for p in shard_paths:
-            p.unlink()
+        return out
 
-    # write the index (which points to `ondisk.ivfdata`) and drop the shards
-    faiss.write_index(index, str(dir / "index.faiss"))
-
-    # copy into the cache
-    copy(dir / "index.faiss", index_cache_path)
-    copy(dir / "ondisk.ivfdata", ondisk_cache_path)
+    def _compute_cache_identifier(self) -> str:
+        return f"make_index_{self._compute_cache_hash()}"
 
 
 def open_ondisk(dir: Path) -> faiss.Index:
@@ -796,27 +850,31 @@ def ensure_tuned(dataset: Dataset, args: TuneArgs) -> None:
     # the queries is to be held out from the making of a provisional index
     queries = dataset.shuffle(seed=42).skip(len(dataset) - args.queries)
 
-    with TemporaryDirectory(dir=CACHE) as tmpdir:
-        tmpdir = Path(tmpdir)
-        working_dir = CACHE if args.use_cache else tmpdir
+    provisioner = GroundTruthProvisioner.with_tune_args(dataset, queries, args)
+    ground_truth = provisioner.provision(progress=args.progress)
 
-        provisioner = GroundTruthProvisioner.with_tune_args(dataset, queries, args)
-        ground_truth = provisioner.provision(progress=args.progress)
+    with queries.formatted_as("torch"):
+        q_ids: torch.Tensor = queries["index"]  # type: ignore
 
-        with queries.formatted_as("torch"):
-            q_ids: torch.Tensor = queries["index"]  # type: ignore
-        make_index(tmpdir, args.empty_index_path, dataset, q_ids, working_dir, args)
-        merged_index = open_ondisk(tmpdir)
-        optimal_params = tune_index(merged_index, ground_truth, args)
+    provisioner = MakeIndexProvisioner.with_args(dataset, q_ids, args)
+    merged_index = provisioner.provision(progress=args.progress).open()
+
+    optimal_params = tune_index(merged_index, ground_truth, args)
 
     with del_on_exc(args.params_path):
         save_params(args.params_path, args.dimensions, args.normalize, optimal_params)
 
 
 def ensure_filled(dataset: Dataset, args: FillArgs) -> None:
-    with del_on_exc([args.ids_path, *args.index_paths]):
+    provisioner = MakeIndexProvisioner.with_args(dataset, None, args)
+    output = provisioner.provision(progress=args.progress)
+
+    index_path, ondisk_path = args.index_paths
+
+    with del_on_exc([args.ids_path, index_path, ondisk_path]):
         save_ids(args.ids_path, dataset)
-        make_index(args.build_dir, args.empty_index_path, dataset, None, CACHE, args)
+        copy(output.index_path, index_path)
+        copy(output.ondisk_path, ondisk_path)
 
 
 def main():
