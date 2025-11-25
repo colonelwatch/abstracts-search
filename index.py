@@ -733,11 +733,6 @@ class MakeIndexProvisioner(Provisioner[MakeIndexOutput]):
         return f"make_index_{self._compute_cache_hash()}"
 
 
-def open_ondisk(dir: Path) -> faiss.Index:
-    # without IO_FLAG_ONDISK_SAME_DIR, read_index gets on-disk indices in working dir
-    return faiss.read_index(str(dir / "index.faiss"), faiss.IO_FLAG_ONDISK_SAME_DIR)
-
-
 def tune_index(
     filled_index: faiss.Index, ground_truth: Dataset, args: TuneArgs
 ) -> list[IndexParameters]:
