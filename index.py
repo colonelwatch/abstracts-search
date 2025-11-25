@@ -33,14 +33,18 @@ import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss
 import numpy as np
 import numpy.typing as npt
 import torch
-from datasets import Dataset, disable_caching, disable_progress_bars
-from datasets.config import HF_DATASETS_CACHE
+from datasets import Dataset, disable_progress_bars
 from datasets.fingerprint import Hasher
 from faiss.contrib.ondisk import merge_ondisk
 from tqdm import tqdm
 
-from utils.cache_utils import get_cache_dir, seal_persistent_cache
-from utils.env_utils import CACHE
+from utils.cache_utils import (
+    clean_hf_cache,
+    clean_persistent_cache,
+    get_cache_dir,
+    seal_hf_cache,
+    seal_persistent_cache,
+)
 from utils.gpu_utils import imap, imap_multi_gpu, iunsqueeze
 
 TRAIN_SIZE_MULTIPLE = 50  # x clusters = train size recommended by FAISS folks
@@ -120,6 +124,9 @@ class CleanArgs(Args):
     def __post_init__(self) -> None:
         super().__post_init__()
         assert self.mode == "clean", f'expected clean mode, got "{self.mode}"'
+
+        if self.source is not None and not self.source.exists():
+            raise ValueError(f'source at "{self.source}" does not exist')
 
 
 @dataclass
@@ -791,39 +798,6 @@ def save_params(
         json.dump(params, f, indent=4)
 
 
-def clean_cache(args: CleanArgs, cache_dir: Path):
-    if cache_dir.exists():
-        rmtree(cache_dir)
-
-    # get cache directory path by following the path to an individual cache file
-    # NOTE: if the cache wasn't created, this will create then delete the cache
-    if args.source is not None and args.source.exists():
-        dataset = load_dataset(args.source)
-        file_0_path = Path(dataset.cache_files[0]["filename"])
-        del dataset
-
-        # parts[0] -> dataset ("parquet" by default)
-        # parts[1] -> cache (pseudorandom, seeded with stuff like file metadata)
-        # since this is a low-level detail, sanity-check the above facts for change
-        file_0_path_rel = file_0_path.relative_to(HF_DATASETS_CACHE)
-        dataset_name = file_0_path_rel.parts[0]
-        cache_name = file_0_path_rel.parts[1]
-        if not (dataset_name == "parquet" and "default-" in cache_name):
-            print("error: path integrity check failed", file=stderr)
-            return 1
-
-        # remove the cache directory
-        hf_cache_dir = HF_DATASETS_CACHE / dataset_name / cache_name
-        rmtree(hf_cache_dir)
-
-        # remove its associated lock
-        for lock in HF_DATASETS_CACHE.iterdir():
-            if not lock.suffix == ".lock":
-                continue
-            if cache_name in str(lock):
-                lock.unlink()
-
-
 def ensure_trained(dataset: Dataset, args: TrainArgs):
     if args.clusters is None:
         clusters = len(dataset) // TRAIN_SIZE_MULTIPLE
@@ -889,15 +863,16 @@ def main():
         return 1
 
     if args.mode == "clean":
-        clean_cache(args, CACHE)
+        clean_persistent_cache()
+        if args.source:
+            # NOTE: if the cache wasn't created, this will create then delete the cache
+            dataset = load_dataset(args.source)
+            clean_hf_cache(dataset)
         return 0
 
     if not args.use_cache:
-        # run through global huggingface datasets settings
-        disable_caching()
+        seal_hf_cache()
         seal_persistent_cache()
-    else:
-        CACHE.mkdir(exist_ok=True)
 
     if not args.progress:
         disable_progress_bars()

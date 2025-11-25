@@ -14,13 +14,16 @@ INDEX_FILL_TARGETS := $(addprefix $(INDEX_DIR)/, ids.parquet index.faiss ondisk.
 INDEX_TRAIN_TARGETS := $(addprefix $(INDEX_DIR)/, empty.faiss untuned.json)
 all: $(INDEX_FILL_TARGETS) $(INDEX_DIR)/params.json
 
-$(INDEX_FILL_TARGETS) &: $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
+.PHONY: $(INDEX_FILL_TARGETS)
+$(INDEX_FILL_TARGETS) &: $(INDEX_TRAIN_TARGETS) # $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
 	$(PYTHON) index.py $(INDEXFLAGS) fill $(INDEXFILLFLAGS) $(DATA_DIR)
 
-$(INDEX_DIR)/params.json: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
+.PHONY: $(INDEX_DIR)/params.json
+$(INDEX_DIR)/params.json: # $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
 
-$(INDEX_TRAIN_TARGETS) &: | $(DATA_DIR)
+.PHONY: $(INDEX_TRAIN_TARGETS)
+$(INDEX_TRAIN_TARGETS) &: # | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
 
 # TODO: better handle the already existing directory
