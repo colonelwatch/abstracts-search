@@ -27,7 +27,16 @@ from itertools import accumulate, tee
 from pathlib import Path
 from shutil import copy, rmtree
 from sys import stderr
-from typing import Any, Generator, Iterable, Literal, Self, TypedDict, Unpack
+from typing import (
+    Any,
+    Generator,
+    Iterable,
+    Literal,
+    Self,
+    TypedDict,
+    Unpack,
+    assert_never,
+)
 
 import faiss  # many monkey-patches, see faiss/python/class_wrappers.py in faiss repo
 import numpy as np
@@ -850,14 +859,17 @@ def main():
     args = parse_args()
 
     try:
-        if args.mode == "clean":
-            args = CleanArgs.from_namespace(args)
-        elif args.mode == "train":
-            args = TrainArgs.from_namespace(args)
-        elif args.mode == "tune":
-            args = TuneArgs.from_namespace(args)
-        else:  # args.mode == "fill"
-            args = FillArgs.from_namespace(args)
+        match args.mode:
+            case "clean":
+                args = CleanArgs.from_namespace(args)
+            case "train":
+                args = TrainArgs.from_namespace(args)
+            case "tune":
+                args = TuneArgs.from_namespace(args)
+            case "fill":
+                args = FillArgs.from_namespace(args)
+            case _ as mode:
+                assert_never(mode)
     except ValueError as e:
         print("error:", e.args[0], file=stderr)
         return 1
@@ -882,12 +894,15 @@ def main():
     if not args.build_dir.exists():
         args.build_dir.mkdir()
 
-    if args.mode == "train":
-        ensure_trained(dataset, args)
-    elif args.mode == "tune":
-        ensure_tuned(dataset, args)
-    else:  # args.mode == "fill"
-        ensure_filled(dataset, args)
+    match args.mode:
+        case "train":
+            ensure_trained(dataset, args)
+        case "tune":
+            ensure_tuned(dataset, args)
+        case "fill":
+            ensure_filled(dataset, args)
+        case _ as mode:
+            assert_never(mode)
 
 
 if __name__ == "__main__":
