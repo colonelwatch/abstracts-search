@@ -197,7 +197,6 @@ class SharedConnection:
         return self._conn
 
 
-# TODO: how do I test this?
 class ParallelFilter:
     def __init__(self, conn: SharedConnection, batch_size: int) -> None:
         self._conn = conn
