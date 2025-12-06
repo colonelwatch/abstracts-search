@@ -197,44 +197,54 @@ class SharedConnection:
         return self._conn
 
 
-def filter_batched(
-    batches: Iterable[DocumentIdBatch],
-    conn: SharedConnection,
-    batch_size: int,
-    n_tasks: int,
-    progress: bool,
-) -> Generator[DocumentIdBatch, None, None]:
-    filtereds: deque[tuple[str, str]] = deque()
+# TODO: how do I test this?
+class ParallelFilter:
+    def __init__(self, conn: SharedConnection, batch_size: int) -> None:
+        self._conn = conn
+        self._batch_size = batch_size
+        self._filtereds: deque[tuple[str, str]] = deque()
+        self._counter: tqdm | None = None
 
-    def roll(drain: bool):
-        nonlocal filtereds
+    def filter(
+        self,
+        batches: Iterable[DocumentIdBatch],
+        n_tasks: int = 0,
+        progress: bool = False,
+    ) -> Generator[DocumentIdBatch, None, None]:
+        if progress:
+            self._counter = tqdm()
 
-        while len(filtereds) >= batch_size or (drain and filtereds):
+        for filtered in imap(batches, self._filt, n_tasks):
+            self._filtereds.extend(filtered.items())
+            yield from self._roll(False)
+        yield from self._roll(True)
+
+        if self._counter is not None:
+            self._counter.close()
+
+    def _filt(self, ids: list[str], documents: list[str]):
+        batch = {id_: document for id_, document in zip(ids, documents)}
+        for id_ in self._conn.pick_existing(ids):
+            del batch[id_]
+
+        if self._counter is not None:
+            self._counter.update(len(ids))  # update with the unfiltered count
+
+        return batch
+
+    def _roll(self, drain: bool):
+        while len(self._filtereds) >= self._batch_size or (drain and self._filtereds):
             ids_out: list[str] = []
             documents_out: list[str] = []
-            for _ in range(batch_size):
+            for _ in range(self._batch_size):
                 try:
-                    id_, document = filtereds.popleft()
+                    id_, document = self._filtereds.popleft()
                 except IndexError:
                     break
                 ids_out.append(id_)
                 documents_out.append(document)
 
             yield ids_out, documents_out
-
-    with tqdm(disable=(not progress)) as count:
-
-        def filt(ids: list[str], documents: list[str]):
-            batch = {id_: document for id_, document in zip(ids, documents)}
-            for id_ in conn.pick_existing(ids):
-                del batch[id_]
-            count.update(len(ids))  # update counter with the unfiltered count
-            return batch
-
-        for filtered in imap(batches, filt, n_tasks):
-            filtereds.extend(filtered.items())
-            yield from roll(False)
-        yield from roll(True)
 
 
 # built from SentenceTransformer.encode but with non-blocking CPU-to-GPU transfers
@@ -289,8 +299,10 @@ def main():
         OaJsonlBatched(args.filter_batch_size) as batches,
         SharedConnection(args.data_path) as conn,
     ):
-        batches = filter_batched(
-            batches, conn, args.batch_size, args.filter_tasks, args.progress
+        parallel_filter = ParallelFilter(conn, args.batch_size)
+
+        batches = parallel_filter.filter(
+            batches=batches, n_tasks=args.filter_tasks, progress=args.progress
         )
         batches = encode_pipelined(batches, model, args.tasks)
         for ids_batch, embeddings_batch in batches:
