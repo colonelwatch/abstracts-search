@@ -13,20 +13,33 @@ INDEXFLAGS += -B $(INDEX_DIR)
 .PHONY: all
 .NOTPARALLEL: all
 INDEX_FILL_TARGETS := $(addprefix $(INDEX_DIR)/, ids.parquet index.faiss ondisk.ivfdata)
+INDEX_TUNE_TARGETS := $(addprefix $(INDEX_DIR)/, params.json)
 INDEX_TRAIN_TARGETS := $(addprefix $(INDEX_DIR)/, empty.faiss untuned.json)
 all: $(INDEX_FILL_TARGETS) $(INDEX_DIR)/params.json
+
+.PHONY: fill
+fill: $(INDEX_FILL_TARGETS)
 
 .NOTPARALLEL: $(INDEX_FILL_TARGETS)
 $(INDEX_FILL_TARGETS) &: $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
 	$(PYTHON) index.py $(INDEXFLAGS) fill $(INDEXFILLFLAGS) $(DATA_DIR)
 
-.NOTPARALLEL: $(INDEX_DIR)/params.json
+.PHONY: tune
+tune: $(INDEX_TUNE_TARGETS)
+
+.NOTPARALLEL: $(INDEX_TUNE_TARGETS)
 $(INDEX_DIR)/params.json: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
+
+.PHONY: train
+train: $(INDEX_TRAIN_TARGETS)
 
 .NOTPARALLEL: $(INDEX_TRAIN_TARGETS)
 $(INDEX_TRAIN_TARGETS) &: | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
+
+.PHONY: dump
+dump: $(DATA_DIR)
 
 include remote_targets.mk
 EQ := =
@@ -34,6 +47,9 @@ $(DATA_DIR) abstracts-embeddings/events &: $(events)
 	rm -rf $(DATA_DIR)
 	$(PYTHON) dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
+
+.PHONY: build
+build: $(events)
 
 # in theory, wouldn't I need to handle two objects in one line here? I could probably
 # update oa_jsonl to handle that?
