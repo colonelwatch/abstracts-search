@@ -301,10 +301,10 @@ class Provisioner[T](ABC):
     def provision(self, progress: bool = False) -> T: ...
 
     def _compute_cache_path(self) -> Path:
-        return get_cache_dir() / self._compute_cache_identifier()
+        return get_cache_dir() / self._compute_cache_filename()
 
     @abstractmethod
-    def _compute_cache_identifier(self) -> str:
+    def _compute_cache_filename(self) -> str:
         return self._compute_cache_hash()
 
     def _compute_cache_hash(self) -> str:
@@ -488,7 +488,7 @@ class GroundTruthProvisioner(Provisioner[Dataset]):
         ground_truth.save_to_disk(cache_path)
         return ground_truth
 
-    def _compute_cache_identifier(self) -> str:
+    def _compute_cache_filename(self) -> str:
         return f"gt_{self._compute_cache_hash()}"
 
 
@@ -569,7 +569,7 @@ class MemmapProvisioner(Provisioner[NDMemmap[np.float32]]):
         memmap = builder.build(cache_path, progress=progress)
         return memmap
 
-    def _compute_cache_identifier(self) -> str:
+    def _compute_cache_filename(self) -> str:
         return f"train_{self._compute_cache_hash()}.memmap"
 
 
@@ -745,7 +745,7 @@ class MakeIndexProvisioner(Provisioner[MakeIndexOutput]):
 
         return out
 
-    def _compute_cache_identifier(self) -> str:
+    def _compute_cache_filename(self) -> str:
         return f"make_index_{self._compute_cache_hash()}"
 
 
