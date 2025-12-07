@@ -9,13 +9,14 @@ PYTHON := conda run -n abstracts-search --live-stream python
 CFLAGS ?= -O2
 INDEXFLAGS += -B $(INDEX_DIR)
 
-# NOTE: Need Make 4.4+ to serialize indexing, otherwise all building is serialized
-.PHONY: all
-.NOTPARALLEL: all
 INDEX_FILL_TARGETS := $(addprefix $(INDEX_DIR)/, ids.parquet index.faiss ondisk.ivfdata)
 INDEX_TUNE_TARGETS := $(addprefix $(INDEX_DIR)/, params.json)
 INDEX_TRAIN_TARGETS := $(addprefix $(INDEX_DIR)/, empty.faiss untuned.json)
-all: $(INDEX_FILL_TARGETS) $(INDEX_DIR)/params.json
+
+# NOTE: Need Make 4.4+ to serialize indexing, otherwise all building is serialized
+.PHONY: all
+.NOTPARALLEL: all
+all: $(INDEX_FILL_TARGETS) $(INDEX_TUNE_TARGETS)
 
 .PHONY: fill
 fill: $(INDEX_FILL_TARGETS)
@@ -28,7 +29,7 @@ $(INDEX_FILL_TARGETS) &: $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
 tune: $(INDEX_TUNE_TARGETS)
 
 .NOTPARALLEL: $(INDEX_TUNE_TARGETS)
-$(INDEX_DIR)/params.json: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
+$(INDEX_TUNE_TARGETS) &: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
 	$(PYTHON) index.py $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
 
 .PHONY: train
