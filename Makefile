@@ -45,7 +45,7 @@ dump: $(DATA_DIR)
 include remote_targets.mk
 EQ := =
 $(DATA_DIR) abstracts-embeddings/events &: $(events)
-	rm -rf $(DATA_DIR)
+	rm -rf $(DATA_DIR) abstracts-embeddings/events
 	$(PYTHON) dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
 
