@@ -4,7 +4,6 @@ INDEX_DIR := abstracts-faiss/index
 -include env.mk
 
 SHELL := bash
-PYTHON := conda run -n abstracts-search --live-stream python
 
 CFLAGS ?= -O2
 INDEXFLAGS += -B $(INDEX_DIR)
@@ -23,21 +22,21 @@ fill: $(INDEX_FILL_TARGETS)
 
 .NOTPARALLEL: $(INDEX_FILL_TARGETS)
 $(INDEX_FILL_TARGETS) &: $(DATA_DIR) $(INDEX_TRAIN_TARGETS)
-	$(PYTHON) index.py $(INDEXFLAGS) fill $(INDEXFILLFLAGS) $(DATA_DIR)
+	sidecar-search index $(INDEXFLAGS) fill $(INDEXFILLFLAGS) $(DATA_DIR)
 
 .PHONY: tune
 tune: $(INDEX_TUNE_TARGETS)
 
 .NOTPARALLEL: $(INDEX_TUNE_TARGETS)
 $(INDEX_TUNE_TARGETS) &: $(INDEX_TRAIN_TARGETS) | $(DATA_DIR)
-	$(PYTHON) index.py $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
+	sidecar-search index $(INDEXFLAGS) tune $(INDEXTUNEFLAGS) $(DATA_DIR)
 
 .PHONY: train
 train: $(INDEX_TRAIN_TARGETS)
 
 .NOTPARALLEL: $(INDEX_TRAIN_TARGETS)
 $(INDEX_TRAIN_TARGETS) &: | $(DATA_DIR)
-	$(PYTHON) index.py $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
+	sidecar-search index $(INDEXFLAGS) train $(INDEXTRAINFLAGS) $(DATA_DIR)
 
 .PHONY: dump
 dump: $(DATA_DIR)
@@ -46,7 +45,7 @@ include remote_targets.mk
 EQ := =
 $(DATA_DIR) abstracts-embeddings/events &: $(events)
 	rm -rf $(DATA_DIR) abstracts-embeddings/events
-	$(PYTHON) dump.py $(DUMPFLAGS) data.sqlite $(DATA_DIR)
+	sidecar-search dump $(DUMPFLAGS) data.sqlite $(DATA_DIR)
 	cp -r events abstracts-embeddings/
 
 .PHONY: build
@@ -61,14 +60,14 @@ events/updated_date$(EQ)% : | manifest.txt oa_jsonl data.sqlite events
 	grep "$(subst events/,,$@)" manifest.txt | 			\
 		sed "s|$$s3_base|$$http_base|" | xargs -- curl -s | 	\
 		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 		\
-		$(PYTHON) build.py $(BUILDFLAGS) data.sqlite
+		sidecar-search build $(BUILDFLAGS) data.sqlite
 	touch $@
 
 oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 data.sqlite:
-	$(PYTHON) -m utils.table_utils $@
+	sidecar-search-table $@
 
 events:
 	mkdir events
@@ -96,7 +95,7 @@ manifest.txt: FORCE
 
 .PHONY: recover
 recover:
-	$(PYTHON) dump.py $(DUMPFLAGS) $(DATA_DIR) data.sqlite
+	sidecar-search dump $(DUMPFLAGS) $(DATA_DIR) data.sqlite
 	cp -r abstracts-embeddings/events ./
 
 .PHONY: clean
