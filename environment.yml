@@ -223,5 +223,5 @@ dependencies:
   - zstandard=0.25.0
   - zstd=1.5.7
   - pip:
-      - git+https://github.com/colonelwatch/sidecar-search.git@0.1.0
+      - git+https://github.com/colonelwatch/sidecar-search.git@v2-transition
 prefix: /home/kenny/miniconda3/envs/abstracts-search
