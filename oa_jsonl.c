@@ -365,7 +365,7 @@ int main(){
 
         int drop = 0;
         char *ptr, *tmp, *tmp_2;
-        char *id, *title, *lang, *abstract;
+        char *id = NULL, *title = NULL, *lang = NULL, *abstract = NULL;
         for (
             ptr = parse_object_open(line);
             (tmp = parse_object_try_close(ptr)) == NULL;
@@ -399,11 +399,11 @@ int main(){
         ptr = tmp;
 
         // TODO: handle UTF-16 surrogate pairs instead of outputting JSON
-        if (title) {
+        if (title && abstract) {
             printf(
                 "{\"id\":\"%s\",\"document\":\"%s %s\"}\n", id, title, abstract
             );
-        } else {
+        } else if (abstract) {
             printf(
                 "{\"id\":\"%s\",\"document\":\"%s\"}\n", id, abstract
             );
