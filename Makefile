@@ -55,12 +55,14 @@ build: $(events)
 # update oa_jsonl to handle that?
 EQ := =
 events/updated_date$(EQ)% : | manifest.txt oa_jsonl data.sqlite events
-	s3_base="s3://openalex/data/works"; 				\
-	http_base="https://openalex.s3.amazonaws.com/data/works"; 	\
-	grep "$(subst events/,,$@)" manifest.txt | 			\
-		sed "s|$$s3_base|$$http_base|" | xargs -- curl -s | 	\
-		gunzip | ./oa_jsonl | mbuffer -q -t -m 16G | 		\
-		sidecar-search build $(BUILDFLAGS) data.sqlite
+	s3_base="s3://openalex/data/works"; \
+	http_base="https://openalex.s3.amazonaws.com/data/works"; \
+	grep "$(subst events/,,$@)" manifest.txt \
+		| sed "s|$$s3_base|$$http_base|" \
+		| xargs -I {} bash -c 'curl -s {} | mbuffer -q -t -m 4G' \
+		| gunzip \
+		| ./oa_jsonl \
+		| sidecar-search build $(BUILDFLAGS) data.sqlite
 	touch $@
 
 oa_jsonl: oa_jsonl.c
