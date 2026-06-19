@@ -8,3 +8,4 @@ __pycache__
 env.mk
 abstracts-faiss
 abstracts-embeddings
+.python-version

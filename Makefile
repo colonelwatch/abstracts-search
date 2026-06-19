@@ -69,7 +69,7 @@ oa_jsonl: oa_jsonl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 data.sqlite:
-	sidecar-search-table $@
+	sidecar-search init $@
 
 events:
 	mkdir events
@@ -102,7 +102,7 @@ recover:
 
 .PHONY: clean
 clean:
-	conda run -n abstracts-search --live-stream python train.py clean
+	sidecar-search index --source $(DATA_DIR) clean
 	rm -rf events
 	rm -rf $(DATA_DIR)
 	rm -rf $(INDEX_DIR)
